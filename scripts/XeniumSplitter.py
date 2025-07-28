@@ -6,6 +6,11 @@ import os
 from pathlib import Path
 import shutil
 from typing import Dict, List, Set
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import multiprocessing as mp
+from functools import partial
+from datetime import datetime
+
 
 class XeniumDataSplitter:
     def __init__(self, xenium_dir: str, cell_stats_file: str, output_base_dir: str):
@@ -52,9 +57,6 @@ class XeniumDataSplitter:
         self.cell_stats.to_csv(updated_stats_file, index=False)
         print(f"Updated cell_stats with subdir column saved to: {updated_stats_file}")
 
-        # Create mapping from cell_id to punch_id
-        # self.cell_id_to_punch = dict(zip(self.cell_stats['cell_id'], self.cell_stats['punch_id']))
-        # ^AI garbage not used in later parts of function
         
     def create_output_directories(self):
         """Create output directories for each punch_id."""
@@ -65,6 +67,130 @@ class XeniumDataSplitter:
             punch_dir.mkdir(exist_ok=True)
             print(f"Created directory: {punch_dir}")
     
+    def split_h5_matrix_optimized(self, n_processes=None):
+            """
+            Optimized version of split_h5_matrix with parallelization and performance improvements.
+            
+            Args:
+                n_processes: Number of processes to use. If None, uses CPU count.
+            """
+            print("Splitting cell feature matrix (optimized)...")
+            
+            if n_processes is None:
+                n_processes = min(mp.cpu_count(), len(self.punch_ids))
+            
+            with h5py.File(self.h5_file, 'r') as f:
+                # Read the matrix structure once
+                matrix_group = f['matrix']
+                features = matrix_group['features']
+                barcodes = matrix_group['barcodes'][:]
+                data = matrix_group['data'][:]
+                indices = matrix_group['indices'][:]
+                indptr = matrix_group['indptr'][:]
+                shape = matrix_group['shape'][:]
+                
+                # Convert barcodes to cell_ids once
+                cell_ids = [barcode.decode('utf-8') if isinstance(barcode, bytes) else str(barcode) 
+                        for barcode in barcodes]
+                cell_id_to_index = {cell_id: i for i, cell_id in enumerate(cell_ids)}
+                
+                # Prepare features data once (copy to avoid issues with multiprocessing)
+                features_data = {}
+                for key in features.keys():
+                    features_data[key] = features[key][:]
+            
+            # Prepare punch data for parallel processing
+            punch_tasks = []
+            for punch_id in self.punch_ids:
+                punch_cell_ids = set(self.cell_stats[self.cell_stats['punch_id'] == punch_id]['Cell ID'])
+                punch_cell_indices = [cell_id_to_index[cell_id] 
+                                    for cell_id in punch_cell_ids 
+                                    if cell_id in cell_id_to_index]
+                
+                if punch_cell_indices:
+                    output_file = self.output_base_dir / f"punch_{punch_id}" / "cell_feature_matrix.h5"
+                    punch_tasks.append({
+                        'punch_id': punch_id,
+                        'cell_indices': punch_cell_indices,
+                        'output_file': output_file,
+                        'barcodes': barcodes,
+                        'data': data,
+                        'indices': indices,
+                        'indptr': indptr,
+                        'shape': shape,
+                        'features_data': features_data
+                    })
+            
+            # Process punches in parallel
+            if n_processes > 1:
+                with ProcessPoolExecutor(max_workers=n_processes) as executor:
+                    futures = [executor.submit(self._process_single_punch, task) for task in punch_tasks]
+                    
+                    for future in futures:
+                        result = future.result()
+                        print(f"Completed punch {result['punch_id']}: {result['cell_count']} cells")
+            else:
+                # Sequential processing for comparison
+                for task in punch_tasks:
+                    result = self._process_single_punch(task)
+                    print(f"Completed punch {result['punch_id']}: {result['cell_count']} cells")
+    
+    @staticmethod
+    def _process_single_punch(task):
+        """
+        Process a single punch in a separate process.
+        This needs to be static to work with multiprocessing.
+        """
+        punch_id = task['punch_id']
+        cell_indices = task['cell_indices']
+        output_file = task['output_file']
+        barcodes = task['barcodes']
+        data = task['data']
+        indices = task['indices']
+        indptr = task['indptr']
+        shape = task['shape']
+        features_data = task['features_data']
+        
+        # Create new matrix for this punch
+        with h5py.File(output_file, 'w') as out_f:
+            matrix_out = out_f.create_group('matrix')
+            
+            # Copy features
+            features_out = matrix_out.create_group('features')
+            for key, data_array in features_data.items():
+                features_out.create_dataset(key, data=data_array)
+            
+            # Filter barcodes
+            punch_barcodes = [barcodes[i] for i in cell_indices]
+            matrix_out.create_dataset('barcodes', data=punch_barcodes)
+            
+            # Extract sparse matrix data for selected cells - OPTIMIZED VERSION
+            # Pre-calculate sizes to avoid dynamic array growth
+            total_elements = sum(indptr[idx + 1] - indptr[idx] for idx in cell_indices)
+            
+            new_data = np.empty(total_elements, dtype=data.dtype)
+            new_indices = np.empty(total_elements, dtype=indices.dtype)
+            new_indptr = np.zeros(len(cell_indices) + 1, dtype=indptr.dtype)
+            
+            current_pos = 0
+            for i, cell_idx in enumerate(cell_indices):
+                start_idx = indptr[cell_idx]
+                end_idx = indptr[cell_idx + 1]
+                cell_size = end_idx - start_idx
+                
+                new_data[current_pos:current_pos + cell_size] = data[start_idx:end_idx]
+                new_indices[current_pos:current_pos + cell_size] = indices[start_idx:end_idx]
+                current_pos += cell_size
+                new_indptr[i + 1] = current_pos
+            
+            matrix_out.create_dataset('data', data=new_data)
+            matrix_out.create_dataset('indices', data=new_indices)
+            matrix_out.create_dataset('indptr', data=new_indptr)
+            matrix_out.create_dataset('shape', data=[shape[0], len(cell_indices)])
+        
+        return {'punch_id': punch_id, 'cell_count': len(cell_indices)}
+
+
     def split_h5_matrix(self):
         """Split the HDF5 cell feature matrix by punch_id."""
         print("Splitting cell feature matrix...")
@@ -208,7 +334,7 @@ class XeniumDataSplitter:
             
             print(f"Saved experiment.xenium for punch {punch_id}")
     
-    def split_all_data(self, experiment_modifications: Dict = None):
+    def split_all_data(self, experiment_modifications: Dict = None, n_processes=1):
         """
         Main method to split all data files by punch_id.
         
@@ -224,9 +350,13 @@ class XeniumDataSplitter:
         self.create_output_directories()
         
         # Split each file type
-        #self.split_h5_matrix()
+        if n_processes >1:
+            self.split_h5_matrix_optimized(n_processes=n_processes)
+        else:
+            self.split_h5_matrix()
+        
         self.split_parquet_files()
-        #self.create_experiment_files(experiment_modifications)
+        self.create_experiment_files(experiment_modifications)
         
         print(f"\nData splitting completed! Output saved to: {self.output_base_dir}")
         print(f"Created {len(self.punch_ids)} subdirectories for punch_ids: {list(self.punch_ids)}")
@@ -237,6 +367,8 @@ if __name__ == "__main__":
     xenium_directory = "/data-raid/Xenium/prime/20250709__200006__XP1_TMA_Mouse_11_Organ_070925_/output-XETG00215__0054040__Region_1__20250709__200021"  # Update this path
     cell_stats_file = "/data-raid/Xenium/prime/20250709__200006__XP1_TMA_Mouse_11_Organ_070925_/QC_metrics/test/all_cell_stats.csv"  # Update this path
     output_directory = "/data-raid/Xenium/prime/20250709__200006__XP1_TMA_Mouse_11_Organ_070925_/XenSplitter/test"  # Update this path
+
+    current_date = datetime.now().strftime('%Y-%m-%d')
     
     # Initialize splitter
     splitter = XeniumDataSplitter(
@@ -248,9 +380,9 @@ if __name__ == "__main__":
     # Define experiment file modifications (optional)
     experiment_mods = {
         'split_by': 'punch_id',
-        'processing_date': '2024-01-01',  # Example modification
+        'processing_date': current_date,  # Example modification
         'sample_name': lambda punch_id: f"sample_punch_{punch_id}"  # Dynamic modification
     }
     
     # Run the splitting
-    splitter.split_all_data(experiment_modifications=experiment_mods)
+    splitter.split_all_data(experiment_modifications=experiment_mods, n_processes=10)
