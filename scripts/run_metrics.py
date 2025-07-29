@@ -50,9 +50,10 @@ def main(
     cells_df = pd.read_parquet(cells_path)
     transcripts_df = pd.read_parquet(transcripts_path)
 
-    # Prepare output dataframe
+    # Prepare output dataframes
     metrics = []
     all_cell_stats = []
+    all_coordinates = []  # New: store all punch coordinates
 
     # Find all coordinate files
     coord_files = [f for f in os.listdir(cell_stats_dir) if f.endswith('_coordinates.csv')]
@@ -65,6 +66,23 @@ def main(
         coords_df = pd.read_csv(coord_path, comment='#')
         x_min, x_max = coords_df["X"].min(), coords_df["X"].max()
         y_min, y_max = coords_df["Y"].min(), coords_df["Y"].max()
+
+        # Store punch coordinates for consolidated output
+        punch_coords = {
+            'punch_id': meta.get('punch_id'),
+            'treatment': meta.get('treatment'),
+            'tissue': meta.get('tissue'),
+            'replicate': meta.get('replicate'),
+            'selection_name': meta.get('selection_name'),
+            'region_area': meta.get('region_area'),
+            'x_min': x_min,
+            'x_max': x_max,
+            'y_min': y_min,
+            'y_max': y_max,
+            'coordinate_file': coord_file,
+            'path': xenium_bundle_path
+        }
+        all_coordinates.append(punch_coords)
 
         # Find matching cell_stats file
         prefix = coord_file.replace('_coordinates.csv', '')
@@ -159,7 +177,7 @@ def main(
         )
 
         # Nuclear transcripts (if nucleus_distance column exists)
-        nuclear_transcripts = high_qv_transcripts[high_qv_transcripts.get('nucleus_distance', pd.Series()) <= 0] if 'nucleus_distance' in high_qv_transcripts.columns else pd.DataFrame()
+        nuclear_transcripts = high_qv_transcripts[high_qv_transcripts.get('nucleus_distance', pd.Series(dtype=float)) <= 0] if 'nucleus_distance' in high_qv_transcripts.columns else pd.DataFrame()
         total_nuclear_transcripts = len(nuclear_transcripts)
         
         # Nuclear transcript density per 100um2
@@ -255,12 +273,16 @@ def main(
         })
         print(f"Completed {coord_file}")
 
+    # Create output directory and save all files
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Save metrics
     metrics_df = pd.DataFrame(metrics)
     metrics_path = os.path.join(output_dir, "region_metrics.csv")
     metrics_df.to_csv(metrics_path, index=False)
     print(f"Saved metrics to {metrics_path}")
 
+    # Save aggregated cell stats
     if all_cell_stats:
         all_cell_stats_df = pd.concat(all_cell_stats, ignore_index=True)
         cell_stats_path = os.path.join(output_dir, "all_cell_stats.csv")
@@ -268,6 +290,16 @@ def main(
         print(f"Saved aggregated cell stats to {cell_stats_path}")
     else:
         print("No cell_stats files found to aggregate.")
+
+    # Save consolidated punch coordinates
+    if all_coordinates:
+        coordinates_df = pd.DataFrame(all_coordinates)
+        coordinates_path = os.path.join(output_dir, "all_punch_coordinates.csv")
+        coordinates_df.to_csv(coordinates_path, index=False)
+        print(f"Saved consolidated punch coordinates to {coordinates_path}")
+        print(f"Coordinates file contains {len(coordinates_df)} punch regions")
+    else:
+        print("No coordinate data found to consolidate.")
 
 if __name__ == '__main__':
     import argparse
