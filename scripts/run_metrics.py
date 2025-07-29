@@ -135,6 +135,87 @@ def main(
         else:
             median_transcripts_per_cell = np.nan
 
+        # Predesigned vs Custom transcript metrics
+        predesigned_transcripts = high_qv_transcripts[high_qv_transcripts['feature_name'].str.startswith('BLANK-') == False]
+        custom_transcripts = high_qv_transcripts[high_qv_transcripts['feature_name'].str.startswith('BLANK-')]
+        
+        total_predesigned_transcripts = len(predesigned_transcripts)
+        total_custom_transcripts = len(custom_transcripts)
+        
+        predesigned_transcripts_in_cells = predesigned_transcripts[predesigned_transcripts['cell_id'] != "UNASSIGNED"]
+        custom_transcripts_in_cells = custom_transcripts[custom_transcripts['cell_id'] != "UNASSIGNED"]
+        
+        total_predesigned_transcripts_in_cells = len(predesigned_transcripts_in_cells)
+        total_custom_transcripts_in_cells = len(custom_transcripts_in_cells)
+        
+        # Fraction of predesigned and custom transcripts decoded at Q20+
+        fraction_predesigned_transcripts_decoded_q20 = (
+            total_predesigned_transcripts / len(filtered_transcripts[filtered_transcripts['feature_name'].str.startswith('BLANK-') == False])
+            if len(filtered_transcripts[filtered_transcripts['feature_name'].str.startswith('BLANK-') == False]) > 0 else np.nan
+        )
+        fraction_custom_transcripts_decoded_q20 = (
+            total_custom_transcripts / len(filtered_transcripts[filtered_transcripts['feature_name'].str.startswith('BLANK-')])
+            if len(filtered_transcripts[filtered_transcripts['feature_name'].str.startswith('BLANK-')]) > 0 else np.nan
+        )
+
+        # Nuclear transcripts (if nucleus_distance column exists)
+        nuclear_transcripts = high_qv_transcripts[high_qv_transcripts.get('nucleus_distance', pd.Series()) <= 0] if 'nucleus_distance' in high_qv_transcripts.columns else pd.DataFrame()
+        total_nuclear_transcripts = len(nuclear_transcripts)
+        
+        # Nuclear transcript density per 100um2
+        nuclear_transcripts_per_100um2 = (
+            total_nuclear_transcripts / (meta.get('region_area', 0) / 1e6) * 100
+            if meta.get('region_area', 0) > 0 else np.nan
+        )
+        
+        # Decoded transcripts per 100um2
+        decoded_transcripts_per_100um2 = (
+            total_high_qv_transcripts / (meta.get('region_area', 0) / 1e6) * 100
+            if meta.get('region_area', 0) > 0 else np.nan
+        )
+        
+        # Cells per 100um2
+        cells_per_100um2 = (
+            num_cells / (meta.get('region_area', 0) / 1e6) * 100
+            if meta.get('region_area', 0) > 0 else np.nan
+        )
+
+        # Gene counts per cell (unique feature_names per cell)
+        if 'cell_id' in transcripts_in_cells.columns and len(transcripts_in_cells) > 0:
+            genes_per_cell = transcripts_in_cells.groupby('cell_id')['feature_name'].nunique()
+            median_genes_per_cell = genes_per_cell.median()
+            
+            predesigned_genes_per_cell = predesigned_transcripts_in_cells.groupby('cell_id')['feature_name'].nunique()
+            median_predesigned_genes_per_cell = predesigned_genes_per_cell.median() if len(predesigned_transcripts_in_cells) > 0 else np.nan
+            
+            custom_genes_per_cell = custom_transcripts_in_cells.groupby('cell_id')['feature_name'].nunique()
+            median_custom_genes_per_cell = custom_genes_per_cell.median() if len(custom_transcripts_in_cells) > 0 else np.nan
+            
+            # Transcripts per cell by type
+            predesigned_transcripts_per_cell = predesigned_transcripts_in_cells.groupby('cell_id').size()
+            median_predesigned_transcripts_per_cell = predesigned_transcripts_per_cell.median() if len(predesigned_transcripts_in_cells) > 0 else np.nan
+            
+            custom_transcripts_per_cell = custom_transcripts_in_cells.groupby('cell_id').size()
+            median_custom_transcripts_per_cell = custom_transcripts_per_cell.median() if len(custom_transcripts_in_cells) > 0 else np.nan
+        else:
+            median_genes_per_cell = np.nan
+            median_predesigned_genes_per_cell = np.nan
+            median_custom_genes_per_cell = np.nan
+            median_predesigned_transcripts_per_cell = np.nan
+            median_custom_transcripts_per_cell = np.nan
+
+        # Control probe metrics (if available in feature_name)
+        #negative_control_transcripts = high_qv_transcripts[high_qv_transcripts['feature_name'].str.contains('NegControl|BLANK', case=False, na=False)]
+        #genomic_control_transcripts = high_qv_transcripts[high_qv_transcripts['feature_name'].str.contains('antisense|Antisense', case=False, na=False)]
+        
+        # Estimated false positives per cell
+        #if num_cells > 0:
+        #    estimated_false_positives_per_cell = len(negative_control_transcripts) / num_cells if len(negative_control_transcripts) > 0 else 0
+        #    estimated_false_positives_including_genomic_per_cell = (len(negative_control_transcripts) + len(genomic_control_transcripts)) / num_cells
+        #else:
+        #    estimated_false_positives_per_cell = np.nan
+        #    estimated_false_positives_including_genomic_per_cell = np.nan
+
         metrics.append({
             'punch_id': meta.get('punch_id'),
             'treatment': meta.get('treatment'),
@@ -146,13 +227,31 @@ def main(
             'median_cell_area': median_cell_area,
             'max_cell_area': max_cell_area,
             'total_cell_area': total_cell_area,
-            'total_transcripts' : total_transcripts,
+            'cells_per_100um2': cells_per_100um2,
+            'total_transcripts': total_transcripts,
             'total_high_qv_transcripts': total_high_qv_transcripts,
+            'fraction_transcripts_decoded_q20': total_high_qv_transcripts / total_transcripts if total_transcripts > 0 else np.nan,
+            'total_predesigned_transcripts': total_predesigned_transcripts,
+            'total_custom_transcripts': total_custom_transcripts,
+            'fraction_predesigned_transcripts_decoded_q20': fraction_predesigned_transcripts_decoded_q20,
+            'fraction_custom_transcripts_decoded_q20': fraction_custom_transcripts_decoded_q20,
+            'total_nuclear_transcripts': total_nuclear_transcripts,
+            'nuclear_transcripts_per_100um2': nuclear_transcripts_per_100um2,
+            'decoded_transcripts_per_100um2': decoded_transcripts_per_100um2,
             'total_transcripts_in_cells': total_transcripts_in_cells,
             'percent_transcripts_in_cells': percent_transcripts_in_cells,
-            'total_empty_cells' : num_empty_cells,
+            'fraction_transcripts_assigned': percent_transcripts_assigned,
+            'total_empty_cells': num_empty_cells,
             'percent_empty_cells': percent_empty_cells,
+            'fraction_empty_cells': percent_empty_cells,
+            'median_genes_per_cell': median_genes_per_cell,
+            'median_predesigned_genes_per_cell': median_predesigned_genes_per_cell,
+            'median_custom_genes_per_cell': median_custom_genes_per_cell,
             'median_transcripts_per_cell': median_transcripts_per_cell,
+            'median_predesigned_transcripts_per_cell': median_predesigned_transcripts_per_cell,
+            'median_custom_transcripts_per_cell': median_custom_transcripts_per_cell,
+        #    'estimated_false_positives_per_cell': estimated_false_positives_per_cell,
+        #    'estimated_false_positives_including_genomic_per_cell': estimated_false_positives_including_genomic_per_cell,
         })
         print(f"Completed {coord_file}")
 
