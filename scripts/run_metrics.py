@@ -48,34 +48,43 @@ def process_region_metrics(cells_df, transcripts_df, x_min, x_max, y_min, y_max,
     # Filter transcripts by coordinates (bounding box)
     filtered_transcripts = transcripts_df[
         transcripts_df["x_location"].between(x_min, x_max) &
-        transcripts_df["y_location"].between(y_min, y_max)
+        transcripts_df["y_location"].between(y_min, y_max) &
+        transcripts_df['is_gene']
     ]
     
     # Filter transcripts by QV
-    high_qv_transcripts = filtered_transcripts[filtered_transcripts['qv'] > qv_threshold]
+    filtered_transcripts_highqv = filtered_transcripts[filtered_transcripts['qv'] > qv_threshold]
 
+########################################################################################################
     # Calculate metrics
-    num_cells = len(filtered_cells)
-    cell_areas = filtered_cells['cell_area'] if 'cell_area' in filtered_cells.columns else pd.Series(dtype=float)
-    min_cell_area = cell_areas.min() if not cell_areas.empty else np.nan
-    median_cell_area = cell_areas.median() if not cell_areas.empty else np.nan
-    max_cell_area = cell_areas.max() if not cell_areas.empty else np.nan
-    total_cell_area = cell_areas.sum() if not cell_areas.empty else np.nan
 
+    # Number of cells
+    num_cells = len(filtered_cells)
+
+    #Cell area stats
+    if 'cell_area' in filtered_cells.columns and not filtered_cells.empty:
+        min_cell_area = filtered_cells['cell_area'].min()
+        median_cell_area = filtered_cells['cell_area'].median()
+        max_cell_area = filtered_cells['cell_area'].max()
+        total_cell_area = filtered_cells['cell_area'].sum()
+    else:
+        min_cell_area = median_cell_area = max_cell_area = total_cell_area = np.nan
+
+    #Transcripts
     total_transcripts = len(filtered_transcripts)
-    total_high_qv_transcripts = len(high_qv_transcripts)
+    total_filtered_transcripts_highqv = len(filtered_transcripts_highqv)
 
     # Number of transcripts in cells (cell_id != "UNASSIGNED")
-    transcripts_in_cells = high_qv_transcripts[high_qv_transcripts['cell_id'] != "UNASSIGNED"]
+    transcripts_in_cells = filtered_transcripts_highqv[filtered_transcripts_highqv['cell_id'] != "UNASSIGNED"]
     total_transcripts_in_cells = len(transcripts_in_cells)
 
     # Percent transcripts in cells
     percent_transcripts_in_cells = (
-        total_transcripts_in_cells / total_high_qv_transcripts
-        if total_high_qv_transcripts > 0 else np.nan
+        total_transcripts_in_cells / total_filtered_transcripts_highqv
+        if total_filtered_transcripts_highqv > 0 else np.nan
     )
 
-    # percent empty cells: cells with zero transcripts assigned
+    # Percent empty cells: cells with zero transcripts assigned
     if 'transcript_counts' in filtered_cells.columns and num_cells > 0:
         num_empty_cells = len(filtered_cells[filtered_cells['transcript_counts'] == 0])
         percent_empty_cells = num_empty_cells/num_cells
@@ -83,43 +92,14 @@ def process_region_metrics(cells_df, transcripts_df, x_min, x_max, y_min, y_max,
         num_empty_cells = np.nan
         percent_empty_cells = np.nan
 
-    # percent transcripts assigned
-    if total_high_qv_transcripts > 0:
-        percent_transcripts_assigned = total_transcripts_in_cells / total_high_qv_transcripts
-    else:
-        percent_transcripts_assigned = np.nan
-
     # Median transcripts per cell
     if 'transcript_counts' in filtered_cells.columns:
         median_transcripts_per_cell = filtered_cells["transcript_counts"].median()
     else:
         median_transcripts_per_cell = np.nan
 
-    # Predesigned vs Custom transcript metrics
-    predesigned_transcripts = high_qv_transcripts[high_qv_transcripts['feature_name'].str.startswith('BLANK-') == False]
-    custom_transcripts = high_qv_transcripts[high_qv_transcripts['feature_name'].str.startswith('BLANK-')]
-    
-    total_predesigned_transcripts = len(predesigned_transcripts)
-    total_custom_transcripts = len(custom_transcripts)
-    
-    predesigned_transcripts_in_cells = predesigned_transcripts[predesigned_transcripts['cell_id'] != "UNASSIGNED"]
-    custom_transcripts_in_cells = custom_transcripts[custom_transcripts['cell_id'] != "UNASSIGNED"]
-    
-    total_predesigned_transcripts_in_cells = len(predesigned_transcripts_in_cells)
-    total_custom_transcripts_in_cells = len(custom_transcripts_in_cells)
-    
-    # Fraction of predesigned and custom transcripts decoded at Q20+
-    fraction_predesigned_transcripts_decoded_q20 = (
-        total_predesigned_transcripts / len(filtered_transcripts[filtered_transcripts['feature_name'].str.startswith('BLANK-') == False])
-        if len(filtered_transcripts[filtered_transcripts['feature_name'].str.startswith('BLANK-') == False]) > 0 else np.nan
-    )
-    fraction_custom_transcripts_decoded_q20 = (
-        total_custom_transcripts / len(filtered_transcripts[filtered_transcripts['feature_name'].str.startswith('BLANK-')])
-        if len(filtered_transcripts[filtered_transcripts['feature_name'].str.startswith('BLANK-')]) > 0 else np.nan
-    )
-
     # Nuclear transcripts
-    nuclear_transcripts = high_qv_transcripts[high_qv_transcripts.get('nucleus_distance', pd.Series(dtype=float)) <= 0] if 'nucleus_distance' in high_qv_transcripts.columns else pd.DataFrame()
+    nuclear_transcripts = filtered_transcripts_highqv[filtered_transcripts_highqv.get('nucleus_distance', pd.Series(dtype=float)) <= 0] if 'nucleus_distance' in filtered_transcripts_highqv.columns else pd.DataFrame()
     total_nuclear_transcripts = len(nuclear_transcripts)
     
     # Nuclear transcript density per 100um2
@@ -130,7 +110,7 @@ def process_region_metrics(cells_df, transcripts_df, x_min, x_max, y_min, y_max,
     
     # Decoded transcripts per 100um2
     decoded_transcripts_per_100um2 = (
-        total_high_qv_transcripts / (meta.get('region_area', 0) / 1e6) * 100
+        total_filtered_transcripts_highqv / (meta.get('region_area', 0) / 1e6) * 100
         if meta.get('region_area', 0) > 0 else np.nan
     )
     
@@ -144,25 +124,11 @@ def process_region_metrics(cells_df, transcripts_df, x_min, x_max, y_min, y_max,
     if 'cell_id' in transcripts_in_cells.columns and len(transcripts_in_cells) > 0:
         genes_per_cell = transcripts_in_cells.groupby('cell_id')['feature_name'].nunique()
         median_genes_per_cell = genes_per_cell.median()
-        
-        predesigned_genes_per_cell = predesigned_transcripts_in_cells.groupby('cell_id')['feature_name'].nunique()
-        median_predesigned_genes_per_cell = predesigned_genes_per_cell.median() if len(predesigned_transcripts_in_cells) > 0 else np.nan
-        
-        custom_genes_per_cell = custom_transcripts_in_cells.groupby('cell_id')['feature_name'].nunique()
-        median_custom_genes_per_cell = custom_genes_per_cell.median() if len(custom_transcripts_in_cells) > 0 else np.nan
-        
-        # Transcripts per cell by type
-        predesigned_transcripts_per_cell = predesigned_transcripts_in_cells.groupby('cell_id').size()
-        median_predesigned_transcripts_per_cell = predesigned_transcripts_per_cell.median() if len(predesigned_transcripts_in_cells) > 0 else np.nan
-        
-        custom_transcripts_per_cell = custom_transcripts_in_cells.groupby('cell_id').size()
-        median_custom_transcripts_per_cell = custom_transcripts_per_cell.median() if len(custom_transcripts_in_cells) > 0 else np.nan
     else:
         median_genes_per_cell = np.nan
-        median_predesigned_genes_per_cell = np.nan
-        median_custom_genes_per_cell = np.nan
-        median_predesigned_transcripts_per_cell = np.nan
-        median_custom_transcripts_per_cell = np.nan
+
+
+    ########################################################################################################
 
     metrics.append({
         'punch_id': meta.get('punch_id'),
@@ -177,27 +143,17 @@ def process_region_metrics(cells_df, transcripts_df, x_min, x_max, y_min, y_max,
         'total_cell_area': total_cell_area,
         'cells_per_100um2': cells_per_100um2,
         'total_transcripts': total_transcripts,
-        'total_high_qv_transcripts': total_high_qv_transcripts,
-        'fraction_transcripts_decoded_q20': total_high_qv_transcripts / total_transcripts if total_transcripts > 0 else np.nan,
-        'total_predesigned_transcripts': total_predesigned_transcripts,
-        'total_custom_transcripts': total_custom_transcripts,
-        'fraction_predesigned_transcripts_decoded_q20': fraction_predesigned_transcripts_decoded_q20,
-        'fraction_custom_transcripts_decoded_q20': fraction_custom_transcripts_decoded_q20,
+        'total_high_qv_transcripts': total_filtered_transcripts_highqv,
+        'fraction_transcripts_decoded_q20': total_filtered_transcripts_highqv / total_transcripts if total_transcripts > 0 else np.nan,
         'total_nuclear_transcripts': total_nuclear_transcripts,
         'nuclear_transcripts_per_100um2': nuclear_transcripts_per_100um2,
         'decoded_transcripts_per_100um2': decoded_transcripts_per_100um2,
         'total_transcripts_in_cells': total_transcripts_in_cells,
         'percent_transcripts_in_cells': percent_transcripts_in_cells,
-        'fraction_transcripts_assigned': percent_transcripts_assigned,
         'total_empty_cells': num_empty_cells,
         'percent_empty_cells': percent_empty_cells,
-        'fraction_empty_cells': percent_empty_cells,
         'median_genes_per_cell': median_genes_per_cell,
-        'median_predesigned_genes_per_cell': median_predesigned_genes_per_cell,
-        'median_custom_genes_per_cell': median_custom_genes_per_cell,
         'median_transcripts_per_cell': median_transcripts_per_cell,
-        'median_predesigned_transcripts_per_cell': median_predesigned_transcripts_per_cell,
-        'median_custom_transcripts_per_cell': median_custom_transcripts_per_cell,
     })
 
 def main(
