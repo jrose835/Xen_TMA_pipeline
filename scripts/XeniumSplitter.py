@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import tempfile
+import pickle
 from typing import Dict, List, Set, Optional
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import multiprocessing as mp
@@ -70,6 +72,7 @@ class XeniumDataSplitter:
     def split_h5_matrix_optimized(self, n_processes=None):
         """
         Split the HDF5 cell feature matrix by punch_id using coordinate-based filtering.
+        Uses file-based communication to avoid multiprocessing memory limits.
         
         Args:
             n_processes: Number of processes to use. If None, uses CPU count.
@@ -79,77 +82,101 @@ class XeniumDataSplitter:
         if n_processes is None:
             n_processes = min(mp.cpu_count(), len(self.punch_ids))
         
-        with h5py.File(self.h5_file, 'r') as f:
-            # Read the matrix structure once
-            matrix_group = f['matrix']
-            features = matrix_group['features']
-            barcodes = matrix_group['barcodes'][:]
-            data = matrix_group['data'][:]
-            indices = matrix_group['indices'][:]
-            indptr = matrix_group['indptr'][:]
-            shape = matrix_group['shape'][:]
-            
-            # Convert barcodes to cell_ids
-            cell_ids = [barcode.decode('utf-8') if isinstance(barcode, bytes) else str(barcode) 
-                       for barcode in barcodes]
-            cell_id_to_index = {cell_id: i for i, cell_id in enumerate(cell_ids)}
-            
-            # Prepare features data
-            features_data = {}
-            for key in features.keys():
-                features_data[key] = features[key][:]
+        # Create temporary directory for shared data
+        temp_dir = Path(tempfile.mkdtemp(prefix="xenium_split_"))
         
-        # Prepare punch data for parallel processing
-        punch_tasks = []
-        for punch_id in self.punch_ids:
-            # Get cells in this punch based on coordinates
-            cells_in_punch = self.get_cells_in_punch(punch_id)
-            punch_cell_ids = set(cells_in_punch['cell_id'].astype(str))
-            
-            # Get indices for cells that exist in the matrix
-            punch_cell_indices = [cell_id_to_index[cell_id] 
-                                for cell_id in punch_cell_ids 
-                                if cell_id in cell_id_to_index]
-            
-            if punch_cell_indices:
-                output_file = self.output_base_dir / f"punch_{punch_id}" / "cell_feature_matrix.h5"
-                punch_tasks.append({
-                    'punch_id': punch_id,
-                    'cell_indices': punch_cell_indices,
-                    'output_file': output_file,
-                    'barcodes': barcodes,
-                    'data': data,
-                    'indices': indices,
-                    'indptr': indptr,
-                    'shape': shape,
-                    'features_data': features_data
-                })
-        
-        # Process punches
-        if n_processes > 1:
-            with ProcessPoolExecutor(max_workers=n_processes) as executor:
-                futures = [executor.submit(self._process_single_punch, task) for task in punch_tasks]
+        try:
+            with h5py.File(self.h5_file, 'r') as f:
+                # Read the matrix structure once
+                matrix_group = f['matrix']
+                features = matrix_group['features']
+                barcodes = matrix_group['barcodes'][:]
+                data = matrix_group['data'][:]
+                indices = matrix_group['indices'][:]
+                indptr = matrix_group['indptr'][:]
+                shape = matrix_group['shape'][:]
                 
-                for future in futures:
-                    result = future.result()
+                # Convert barcodes to cell_ids
+                cell_ids = [barcode.decode('utf-8') if isinstance(barcode, bytes) else str(barcode) 
+                           for barcode in barcodes]
+                cell_id_to_index = {cell_id: i for i, cell_id in enumerate(cell_ids)}
+                
+                # Prepare features data
+                features_data = {}
+                for key in features.keys():
+                    features_data[key] = features[key][:]
+            
+            # Save large arrays to temporary files instead of passing through queue
+            shared_data_file = temp_dir / "shared_data.pkl"
+            shared_data = {
+                'barcodes': barcodes,
+                'data': data,
+                'indices': indices,
+                'indptr': indptr,
+                'shape': shape,
+                'features_data': features_data,
+                'cell_id_to_index': cell_id_to_index
+            }
+            
+            with open(shared_data_file, 'wb') as f:
+                pickle.dump(shared_data, f)
+            
+            # Prepare punch tasks (now only small data through queue)
+            punch_tasks = []
+            for punch_id in self.punch_ids:
+                # Get cells in this punch based on coordinates
+                cells_in_punch = self.get_cells_in_punch(punch_id)
+                punch_cell_ids = set(cells_in_punch['cell_id'].astype(str))
+                
+                # Get indices for cells that exist in the matrix
+                punch_cell_indices = [cell_id_to_index[cell_id] 
+                                    for cell_id in punch_cell_ids 
+                                    if cell_id in cell_id_to_index]
+                
+                if punch_cell_indices:
+                    output_file = self.output_base_dir / f"punch_{punch_id}" / "cell_feature_matrix.h5"
+                    punch_tasks.append({
+                        'punch_id': punch_id,
+                        'cell_indices': punch_cell_indices,
+                        'output_file': str(output_file),
+                        'shared_data_file': str(shared_data_file)  # Only pass file path
+                    })
+            
+            # Process punches in parallel
+            if n_processes > 1:
+                with ProcessPoolExecutor(max_workers=n_processes) as executor:
+                    futures = [executor.submit(self._process_single_punch_from_file, task) for task in punch_tasks]
+                    
+                    for future in futures:
+                        result = future.result()
+                        print(f"Completed punch {result['punch_id']}: {result['cell_count']} cells")
+            else:
+                for task in punch_tasks:
+                    result = self._process_single_punch_from_file(task)
                     print(f"Completed punch {result['punch_id']}: {result['cell_count']} cells")
-        else:
-            for task in punch_tasks:
-                result = self._process_single_punch(task)
-                print(f"Completed punch {result['punch_id']}: {result['cell_count']} cells")
+        
+        finally:
+            # Clean up temporary directory
+            shutil.rmtree(temp_dir, ignore_errors=True)
     
     @staticmethod
-    def _process_single_punch(task):
-        """Process a single punch in a separate process."""
+    def _process_single_punch_from_file(task):
+        """Process a single punch by loading shared data from file."""
         punch_id = task['punch_id']
         cell_indices = task['cell_indices']
         output_file = task['output_file']
-        barcodes = task['barcodes']
-        data = task['data']
-        indices = task['indices']
-        indptr = task['indptr']
-        shape = task['shape']
-        features_data = task['features_data']
+        shared_data_file = task['shared_data_file']
+        
+        # Load shared data from file
+        with open(shared_data_file, 'rb') as f:
+            shared_data = pickle.load(f)
+        
+        barcodes = shared_data['barcodes']
+        data = shared_data['data']
+        indices = shared_data['indices']
+        indptr = shared_data['indptr']
+        shape = shared_data['shape']
+        features_data = shared_data['features_data']
         
         # Create new matrix for this punch
         with h5py.File(output_file, 'w') as out_f:
@@ -304,7 +331,7 @@ class XeniumDataSplitter:
         
         Args:
             experiment_modifications: Dictionary of modifications for experiment.xenium files (ignored)
-            n_processes: Number of CPU used for parrallel process H5 matrix splitting
+            n_processes: Number of CPU used for parallel process H5 matrix splitting
         """
         print("Starting Xenium data splitting (coordinate-based)...")
         
@@ -341,7 +368,6 @@ class XeniumDataSplitter:
         self.create_output_directories()
         
         # Split each file type
-
         self.split_h5_matrix_optimized(n_processes=n_processes)
         self.split_parquet_files()
         self.split_transcripts_file()
