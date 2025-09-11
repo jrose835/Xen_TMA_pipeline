@@ -2,7 +2,7 @@
 A processing pipeline for tissue microarrays run on the Xenium spatial transcriptomics platform
 
 This pipeline splits Xenium data based on spatial coordinates only.
-It filters cells and transcripts that fall within the coordinate bounds of each punch region, and can also simulaten.
+It filters cells and transcripts that fall within the coordinate bounds of each punch region, and can also filter by cell size or minimum transcript number.
 
 ## Examples:
   #### Using individual coordinate files from cell_stats_dir
