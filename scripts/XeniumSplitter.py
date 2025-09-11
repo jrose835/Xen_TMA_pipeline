@@ -15,7 +15,7 @@ from datetime import datetime
 
 
 class XeniumDataSplitter:
-    def __init__(self, xenium_dir: str, punch_coordinates_file: str, output_base_dir: str):
+    def __init__(self, xenium_dir: str, punch_coordinates_file: str, output_base_dir: str, cell_blacklist: Set[str] = None):
         """
         Initialize the Xenium data splitter for coordinate-based splitting.
         
@@ -23,10 +23,12 @@ class XeniumDataSplitter:
             xenium_dir: Path to directory containing Xenium files
             punch_coordinates_file: Path to all_punch_coordinates.csv file
             output_base_dir: Base directory for output subdirectories
+            cell_blacklist: Set of cell_ids to blacklist (optional)
         """
         self.xenium_dir = Path(xenium_dir)
         self.punch_coordinates_file = Path(punch_coordinates_file)
         self.output_base_dir = Path(output_base_dir)
+        self.cell_blacklist = cell_blacklist or set()
         
         # File paths
         self.h5_file = self.xenium_dir / "cell_feature_matrix.h5"
@@ -47,6 +49,13 @@ class XeniumDataSplitter:
         print("Loading cells data...")
         self.cells_df = pd.read_parquet(self.cells_file)
         print(f"Loaded {len(self.cells_df)} cells")
+        
+        # Apply blacklist filtering
+        if self.cell_blacklist:
+            pre_blacklist_count = len(self.cells_df)
+            self.cells_df = self.cells_df[~self.cells_df['cell_id'].astype(str).isin(self.cell_blacklist)]
+            blacklisted_count = pre_blacklist_count - len(self.cells_df)
+            print(f"Filtered out {blacklisted_count} blacklisted cells, {len(self.cells_df)} cells remaining")
         
     def create_output_directories(self):
         """Create output directories for each punch_id."""
@@ -124,7 +133,7 @@ class XeniumDataSplitter:
             # Prepare punch tasks (now only small data through queue)
             punch_tasks = []
             for punch_id in self.punch_ids:
-                # Get cells in this punch based on coordinates
+                # Get cells in this punch based on coordinates (already filtered by blacklist)
                 cells_in_punch = self.get_cells_in_punch(punch_id)
                 punch_cell_ids = set(cells_in_punch['cell_id'].astype(str))
                 
@@ -232,8 +241,16 @@ class XeniumDataSplitter:
             print(f"Splitting {filename}...")
             df = pd.read_parquet(filepath)
             
+            # Apply blacklist to the dataframe if it has cell_id column
+            if self.cell_blacklist and 'cell_id' in df.columns:
+                pre_blacklist_count = len(df)
+                df = df[~df['cell_id'].astype(str).isin(self.cell_blacklist)]
+                blacklisted_count = pre_blacklist_count - len(df)
+                if blacklisted_count > 0:
+                    print(f"  Filtered {blacklisted_count} blacklisted cells from {filename}")
+            
             for punch_id in self.punch_ids:
-                # Get cells in this punch
+                # Get cells in this punch (already blacklist-filtered)
                 cells_in_punch = self.get_cells_in_punch(punch_id)
                 punch_cell_ids = set(cells_in_punch['cell_id'].astype(str))
                 
@@ -261,6 +278,13 @@ class XeniumDataSplitter:
         
         print("Splitting transcripts.parquet...")
         transcripts_df = pd.read_parquet(self.transcripts_file)
+        
+        # Apply blacklist to transcripts: reassign blacklisted cell transcripts to 'UNASSIGNED'
+        if self.cell_blacklist:
+            blacklisted_transcript_mask = transcripts_df['cell_id'].astype(str).isin(self.cell_blacklist)
+            transcripts_df.loc[blacklisted_transcript_mask, 'cell_id'] = 'UNASSIGNED'
+            if blacklisted_transcript_mask.sum() > 0:
+                print(f"  Reassigned {blacklisted_transcript_mask.sum()} transcripts from blacklisted cells to 'UNASSIGNED'")
         
         for punch_id in self.punch_ids:
             coords = self.punch_coordinates[punch_id]
@@ -361,7 +385,7 @@ class XeniumDataSplitter:
             }
             print(f"Loaded coordinates for punch_id {punch_id}: x=[{row['x_min']:.1f}, {row['x_max']:.1f}], y=[{row['y_min']:.1f}, {row['y_max']:.1f}]")
         
-        # Load cells data
+        # Load cells data (with blacklist filtering applied)
         self.load_cells_data()
         
         # Create output directories

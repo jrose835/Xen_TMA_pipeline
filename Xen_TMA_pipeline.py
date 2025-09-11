@@ -18,6 +18,8 @@ from pathlib import Path
 from datetime import datetime
 import tempfile
 import shutil
+import pandas as pd
+import numpy as np
 
 # Add the scripts directory to the Python path so we can import our modules
 script_dir = Path(__file__).parent / "scripts"
@@ -30,6 +32,53 @@ except ImportError as e:
     print(f"Error importing required modules: {e}")
     print("Make sure run_metrics.py and XeniumSplitter.py are in the scripts/ directory")
     sys.exit(1)
+
+
+def create_cell_blacklist(xenium_bundle_path, min_transcripts=None, min_area=None):
+    """
+    Create a blacklist of cell_ids based on transcript counts and cell area thresholds.
+    
+    Args:
+        xenium_bundle_path: Path to Xenium bundle directory
+        min_transcripts: Minimum transcript count threshold (optional)
+        min_area: Minimum cell area threshold (optional)
+        
+    Returns:
+        set: Set of cell_ids to blacklist
+    """
+    if min_transcripts is None and min_area is None:
+        return set()
+    
+    print("Creating cell blacklist based on quality filters...")
+    
+    # Load cells data
+    cells_path = os.path.join(xenium_bundle_path, 'cells.parquet')
+    if not os.path.exists(cells_path):
+        raise FileNotFoundError(f"cells.parquet not found: {cells_path}")
+    
+    cells_df = pd.read_parquet(cells_path)
+    blacklist = set()
+    
+    # Filter by transcript count
+    if min_transcripts is not None:
+        if 'transcript_counts' not in cells_df.columns:
+            print("Warning: transcript_counts column not found in cells.parquet, skipping transcript filter")
+        else:
+            low_transcript_cells = cells_df[cells_df['transcript_counts'] < min_transcripts]['cell_id']
+            blacklist.update(low_transcript_cells.astype(str))
+            print(f"Blacklisted {len(low_transcript_cells)} cells with < {min_transcripts} transcripts")
+    
+    # Filter by cell area
+    if min_area is not None:
+        if 'cell_area' not in cells_df.columns:
+            print("Warning: cell_area column not found in cells.parquet, skipping area filter")
+        else:
+            small_area_cells = cells_df[cells_df['cell_area'] < min_area]['cell_id']
+            blacklist.update(small_area_cells.astype(str))
+            print(f"Blacklisted {len(small_area_cells)} cells with < {min_area} area")
+    
+    print(f"Total cells blacklisted: {len(blacklist)}")
+    return blacklist
 
 
 def validate_paths(args):
@@ -68,7 +117,7 @@ def validate_paths(args):
         raise FileNotFoundError(f"Required files missing from Xenium bundle: {missing_files}")
 
 
-def run_metrics_step(args):
+def run_metrics_step(args, cell_blacklist):
     """Run the metrics calculation step."""
     print("=" * 60)
     print("STEP 1: Running QC metrics calculation")
@@ -84,7 +133,8 @@ def run_metrics_step(args):
                 cell_stats_dir=None,  # Signal to use coordinates file
                 output_dir=args.output_dir,
                 qv_threshold=args.qv_threshold,
-                coordinates_file=args.coordinates_file
+                coordinates_file=args.coordinates_file,
+                cell_blacklist=cell_blacklist
             )
         else:
             # Use cell_stats_dir for metrics
@@ -93,7 +143,8 @@ def run_metrics_step(args):
                 xenium_bundle_path=args.xenium_bundle_path,
                 cell_stats_dir=args.cell_stats_dir,
                 output_dir=args.output_dir,
-                qv_threshold=args.qv_threshold
+                qv_threshold=args.qv_threshold,
+                cell_blacklist=cell_blacklist
             )
         
         print("✓ Metrics calculation completed successfully")
@@ -119,40 +170,9 @@ def run_metrics_step(args):
     except Exception as e:
         print(f"✗ Error in metrics calculation: {e}")
         return False
-        
-    try:
-        run_metrics_main(
-            xenium_bundle_path=args.xenium_bundle_path,
-            cell_stats_dir=args.cell_stats_dir,
-            output_dir=args.output_dir,
-            qv_threshold=args.qv_threshold
-        )
-        print("✓ Metrics calculation completed successfully")
-        
-        # Verify output files were created
-        expected_files = ["region_metrics.csv"]
-        
-        # Only expect all_punch_coordinates.csv and all_cell_stats.csv when using cell_stats_dir
-        if args.cell_stats_dir:
-            expected_files.extend(["all_punch_coordinates.csv", "all_cell_stats.csv"])
-        
-        missing_outputs = []
-        for file in expected_files:
-            file_path = Path(args.output_dir) / file
-            if not file_path.exists():
-                missing_outputs.append(file)
-        
-        if missing_outputs:
-            raise FileNotFoundError(f"Expected output files not created: {missing_outputs}")
-            
-        return True
-        
-    except Exception as e:
-        print(f"✗ Error in metrics calculation: {e}")
-        return False
 
 
-def run_splitter_step(args):
+def run_splitter_step(args, cell_blacklist):
     """Run the coordinate-based data splitting step."""
     print("\n" + "=" * 60)
     print("STEP 2: Splitting Xenium data by array regions (coordinate-based)")
@@ -177,7 +197,8 @@ def run_splitter_step(args):
         splitter = XeniumDataSplitter(
             xenium_dir=args.xenium_bundle_path,
             punch_coordinates_file=str(coordinates_file),
-            output_base_dir=str(outs_dir)
+            output_base_dir=str(outs_dir),
+            cell_blacklist=cell_blacklist
         )
         
         # Define experiment file modifications
@@ -221,11 +242,13 @@ Examples:
     --coordinates_file /path/to/all_punch_coordinates.csv \\
     --output_dir /path/to/output
 
-  # With custom settings
+  # With quality filters
   python Xen_TMA_pipeline.py \\
     --xenium_bundle_path /path/to/xenium/output \\
     --cell_stats_dir /path/to/cell_stats \\
     --output_dir /path/to/output \\
+    --min_transcripts 10 \\
+    --min_area 50 \\
     --qv_threshold 25 \\
     --n_processes 8
         """
@@ -268,6 +291,18 @@ Examples:
         help='Number of processes for parallel data splitting (default: 4)'
     )
     
+    # Quality filter arguments
+    parser.add_argument(
+        '--min_transcripts',
+        type=int,
+        help='Minimum transcript count per cell (cells below this will be blacklisted)'
+    )
+    parser.add_argument(
+        '--min_area',
+        type=float,
+        help='Minimum cell area (cells below this will be blacklisted)'
+    )
+    
     args = parser.parse_args()
     
     # Print pipeline information
@@ -281,6 +316,16 @@ Examples:
     print(f"Output directory: {args.output_dir}")
     print(f"QV threshold: {args.qv_threshold}")
     print(f"Number of processes: {args.n_processes}")
+    
+    # Print quality filters
+    if args.min_transcripts or args.min_area:
+        print("Quality filters:")
+        if args.min_transcripts:
+            print(f"  Minimum transcripts per cell: {args.min_transcripts}")
+        if args.min_area:
+            print(f"  Minimum cell area: {args.min_area}")
+    else:
+        print("No quality filters applied")
     print("=" * 60)
     
     # Validate input paths
@@ -291,6 +336,17 @@ Examples:
         print(f"✗ Input validation failed: {e}")
         sys.exit(1)
     
+    # Create cell blacklist based on quality filters
+    try:
+        cell_blacklist = create_cell_blacklist(
+            xenium_bundle_path=args.xenium_bundle_path,
+            min_transcripts=args.min_transcripts,
+            min_area=args.min_area
+        )
+    except Exception as e:
+        print(f"✗ Error creating cell blacklist: {e}")
+        sys.exit(1)
+    
     # Create output directory
     output_path = Path(args.output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -298,12 +354,12 @@ Examples:
     success = False
     try:
         # Step 1: Run metrics calculation
-        if not run_metrics_step(args):
+        if not run_metrics_step(args, cell_blacklist):
             print("Pipeline failed at metrics calculation step")
             sys.exit(1)
         
         # Step 2: Run coordinate-based data splitting
-        if not run_splitter_step(args):
+        if not run_splitter_step(args, cell_blacklist):
             print("Pipeline failed at data splitting step")
             sys.exit(1)
         
@@ -328,6 +384,12 @@ Examples:
             print("  - all_cell_stats.csv (aggregated cell statistics)")
         print("  - outs/punch_*/  (individual punch data directories)")
         print("  - outs/punch_cell_summary.csv (summary of cells per punch)")
+        
+        if cell_blacklist:
+            print(f"\nQuality filters applied:")
+            print(f"  - {len(cell_blacklist)} cells blacklisted and removed from outputs")
+            print(f"  - Transcripts from blacklisted cells reassigned to 'UNASSIGNED'")
+        
         print("\nNote: Data was split using coordinate-based filtering only.")
         print("Cells and transcripts were assigned to punches based on their spatial location.")
         print("=" * 60)

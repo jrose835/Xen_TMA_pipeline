@@ -37,13 +37,21 @@ def parse_metadata_from_header(csv_path):
     return meta
 
 def process_region_metrics(cells_df, transcripts_df, x_min, x_max, y_min, y_max,
-                         meta, xenium_bundle_path, qv_threshold, metrics):
+                         meta, xenium_bundle_path, qv_threshold, metrics, cell_blacklist=None):
     """Process metrics for a single punch region."""
     # Filter cells by coordinates (bounding box)
     filtered_cells = cells_df[
         cells_df["x_centroid"].between(x_min, x_max) &
         cells_df["y_centroid"].between(y_min, y_max)
     ]
+    
+    # Apply cell blacklist filter
+    if cell_blacklist:
+        pre_blacklist_count = len(filtered_cells)
+        filtered_cells = filtered_cells[~filtered_cells['cell_id'].astype(str).isin(cell_blacklist)]
+        blacklisted_in_region = pre_blacklist_count - len(filtered_cells)
+        if blacklisted_in_region > 0:
+            print(f"  Filtered out {blacklisted_in_region} blacklisted cells in punch {meta.get('punch_id', 'unknown')}")
     
     # Filter transcripts by coordinates (bounding box)
     filtered_transcripts = transcripts_df[
@@ -52,10 +60,20 @@ def process_region_metrics(cells_df, transcripts_df, x_min, x_max, y_min, y_max,
         transcripts_df['is_gene']
     ]
     
+    # Apply blacklist to transcripts: reassign blacklisted cell transcripts to 'UNASSIGNED'
+    if cell_blacklist:
+        # Create a copy to avoid modifying original data
+        filtered_transcripts = filtered_transcripts.copy()
+        blacklisted_transcript_mask = filtered_transcripts['cell_id'].astype(str).isin(cell_blacklist)
+        filtered_transcripts.loc[blacklisted_transcript_mask, 'cell_id'] = 'UNASSIGNED'
+        
+        if blacklisted_transcript_mask.sum() > 0:
+            print(f"  Reassigned {blacklisted_transcript_mask.sum()} transcripts from blacklisted cells to 'UNASSIGNED' in punch {meta.get('punch_id', 'unknown')}")
+    
     # Filter transcripts by QV
     filtered_transcripts_highqv = filtered_transcripts[filtered_transcripts['qv'] > qv_threshold]
 
-########################################################################################################
+    ########################################################################################################
     # Calculate metrics
 
     # Number of cells
@@ -86,15 +104,22 @@ def process_region_metrics(cells_df, transcripts_df, x_min, x_max, y_min, y_max,
 
     # Percent empty cells: cells with zero transcripts assigned
     if 'transcript_counts' in filtered_cells.columns and num_cells > 0:
-        num_empty_cells = len(filtered_cells[filtered_cells['transcript_counts'] == 0])
-        percent_empty_cells = num_empty_cells/num_cells
+        # Note: transcript_counts may be outdated after blacklist filtering
+        # For accurate empty cell calculation, we should recalculate based on filtered transcripts
+        valid_cell_ids = set(filtered_cells['cell_id'].astype(str))
+        transcripts_per_cell = transcripts_in_cells.groupby('cell_id').size()
+        cells_with_transcripts = set(transcripts_per_cell.index.astype(str))
+        empty_cells = valid_cell_ids - cells_with_transcripts
+        num_empty_cells = len(empty_cells)
+        percent_empty_cells = num_empty_cells / num_cells if num_cells > 0 else np.nan
     else:
         num_empty_cells = np.nan
         percent_empty_cells = np.nan
 
-    # Median transcripts per cell
-    if 'transcript_counts' in filtered_cells.columns:
-        median_transcripts_per_cell = filtered_cells["transcript_counts"].median()
+    # Median transcripts per cell (recalculated from filtered data)
+    if len(transcripts_in_cells) > 0 and num_cells > 0:
+        transcripts_per_cell = transcripts_in_cells.groupby('cell_id').size()
+        median_transcripts_per_cell = transcripts_per_cell.median()
     else:
         median_transcripts_per_cell = np.nan
 
@@ -126,7 +151,6 @@ def process_region_metrics(cells_df, transcripts_df, x_min, x_max, y_min, y_max,
         median_genes_per_cell = genes_per_cell.median()
     else:
         median_genes_per_cell = np.nan
-
 
     ########################################################################################################
 
@@ -161,7 +185,8 @@ def main(
     cell_stats_dir=None,
     output_dir="./",
     qv_threshold=20,
-    coordinates_file=None
+    coordinates_file=None,
+    cell_blacklist=None
 ):
     # Load Xenium bundle files
     cells_path = os.path.join(xenium_bundle_path, 'cells.parquet')
@@ -169,6 +194,15 @@ def main(
     print("Loading files")
     cells_df = pd.read_parquet(cells_path)
     transcripts_df = pd.read_parquet(transcripts_path)
+
+    # Apply blacklist to transcripts: reassign blacklisted cell transcripts to 'UNASSIGNED'
+    if cell_blacklist:
+        print(f"Applying blacklist to {len(cell_blacklist)} cells...")
+        # Create a copy to avoid modifying original data
+        transcripts_df = transcripts_df.copy()
+        blacklisted_transcript_mask = transcripts_df['cell_id'].astype(str).isin(cell_blacklist)
+        transcripts_df.loc[blacklisted_transcript_mask, 'cell_id'] = 'UNASSIGNED'
+        print(f"Reassigned {blacklisted_transcript_mask.sum()} transcripts from blacklisted cells to 'UNASSIGNED'")
 
     # Prepare output dataframes
     metrics = []
@@ -202,7 +236,7 @@ def main(
             # Process metrics for this punch
             process_region_metrics(
                 cells_df, transcripts_df, x_min, x_max, y_min, y_max,
-                meta, xenium_bundle_path, qv_threshold, metrics
+                meta, xenium_bundle_path, qv_threshold, metrics, cell_blacklist
             )
         
         # Don't create new all_coordinates when using existing file
@@ -246,6 +280,15 @@ def main(
             if os.path.exists(cell_stats_path):
                 # Read cell_stats CSV (skip header lines) and append meta columns
                 cell_stats_df = pd.read_csv(cell_stats_path, comment='#')
+                
+                # Apply blacklist to cell_stats
+                if cell_blacklist:
+                    pre_blacklist_count = len(cell_stats_df)
+                    cell_stats_df = cell_stats_df[~cell_stats_df['cell_id'].astype(str).isin(cell_blacklist)]
+                    blacklisted_count = pre_blacklist_count - len(cell_stats_df)
+                    if blacklisted_count > 0:
+                        print(f"  Filtered {blacklisted_count} blacklisted cells from cell_stats")
+                
                 for key, value in meta.items():
                     cell_stats_df[key] = value
                 cell_stats_df["path"] = xenium_bundle_path
@@ -254,7 +297,7 @@ def main(
             # Process metrics for this punch
             process_region_metrics(
                 cells_df, transcripts_df, x_min, x_max, y_min, y_max,
-                meta, xenium_bundle_path, qv_threshold, metrics
+                meta, xenium_bundle_path, qv_threshold, metrics, cell_blacklist
             )
             print(f"Completed {coord_file}")
         
