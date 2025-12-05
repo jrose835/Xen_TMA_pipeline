@@ -1,0 +1,7 @@
+data
+_pycahce
+__pycache__
+toy_data
+*.ini
+tests
+.Rhistory

@@ -28,9 +28,10 @@ sys.path.insert(0, str(script_dir))
 try:
     from run_metrics import main as run_metrics_main
     from XeniumSplitter import XeniumDataSplitter
+    from parquet_to_zarr import convert_all_punches
 except ImportError as e:
     print(f"Error importing required modules: {e}")
-    print("Make sure run_metrics.py and XeniumSplitter.py are in the scripts/ directory")
+    print("Make sure run_metrics.py, XeniumSplitter.py, and parquet_to_zarr.py are in the scripts/ directory")
     sys.exit(1)
 
 
@@ -213,9 +214,41 @@ def run_splitter_step(args, cell_blacklist):
         
         print("✓ Data splitting completed successfully")
         return True
-        
+
     except Exception as e:
         print(f"✗ Error in data splitting: {e}")
+        return False
+
+
+def run_zarr_conversion_step(args):
+    """Run the parquet to zarr conversion step for Xenium Explorer compatibility."""
+    print("\n" + "=" * 60)
+    print("STEP 3: Converting parquet files to cells.zarr.zip format")
+    print("=" * 60)
+
+    try:
+        # Get the outs directory containing punch_* subdirectories
+        outs_dir = Path(args.output_dir) / "outs"
+
+        if not outs_dir.exists():
+            raise FileNotFoundError(f"Output directory not found: {outs_dir}")
+
+        # Run the conversion
+        success_count, total_count = convert_all_punches(
+            outs_dir=str(outs_dir),
+            overwrite=args.overwrite_zarr,
+            verbose=True
+        )
+
+        if success_count == total_count:
+            print(f"✓ Zarr conversion completed successfully ({success_count}/{total_count} directories)")
+            return True
+        else:
+            print(f"✗ Zarr conversion partially failed ({success_count}/{total_count} directories)")
+            return False
+
+    except Exception as e:
+        print(f"✗ Error in zarr conversion: {e}")
         return False
 
 
@@ -302,7 +335,19 @@ Examples:
         type=float,
         help='Minimum cell area (cells below this will be blacklisted)'
     )
-    
+
+    # Zarr conversion arguments
+    parser.add_argument(
+        '--create_zarr',
+        action='store_true',
+        help='Create cells.zarr.zip files for Xenium Explorer/SEGGER compatibility'
+    )
+    parser.add_argument(
+        '--overwrite_zarr',
+        action='store_true',
+        help='Overwrite existing cells.zarr.zip files (default: skip if exists)'
+    )
+
     args = parser.parse_args()
     
     # Print pipeline information
@@ -326,6 +371,7 @@ Examples:
             print(f"  Minimum cell area: {args.min_area}")
     else:
         print("No quality filters applied")
+    print(f"Create zarr files: {args.create_zarr}")
     print("=" * 60)
     
     # Validate input paths
@@ -362,7 +408,13 @@ Examples:
         if not run_splitter_step(args, cell_blacklist):
             print("Pipeline failed at data splitting step")
             sys.exit(1)
-        
+
+        # Step 3: Convert parquet files to zarr format (optional)
+        if args.create_zarr:
+            if not run_zarr_conversion_step(args):
+                print("Pipeline failed at zarr conversion step")
+                sys.exit(1)
+
         success = True
         
     except KeyboardInterrupt:
@@ -384,14 +436,18 @@ Examples:
             print("  - all_cell_stats.csv (aggregated cell statistics)")
         print("  - outs/punch_*/  (individual punch data directories)")
         print("  - outs/punch_cell_summary.csv (summary of cells per punch)")
-        
+        if args.create_zarr:
+            print("  - outs/punch_*/cells.zarr.zip (Xenium Explorer compatible files)")
+
         if cell_blacklist:
             print(f"\nQuality filters applied:")
             print(f"  - {len(cell_blacklist)} cells blacklisted and removed from outputs")
             print(f"  - Transcripts from blacklisted cells reassigned to 'UNASSIGNED'")
-        
+
         print("\nNote: Data was split using coordinate-based filtering only.")
         print("Cells and transcripts were assigned to punches based on their spatial location.")
+        if args.create_zarr:
+            print("Zarr files created for Xenium Explorer/SEGGER compatibility.")
         print("=" * 60)
     
 
