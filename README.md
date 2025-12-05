@@ -32,3 +32,13 @@ It filters cells and transcripts that fall within the coordinate bounds of each 
     --qv_threshold 25 \\
     --n_processes 8
   ```
+
+  #### With zarr conversion for creating cells.zarr.zip files
+  ```
+  python Xen_TMA_pipeline.py \\
+    --xenium_bundle_path /path/to/xenium/output \\
+    --cell_stats_dir /path/to/cell_stats \\
+    --output_dir /path/to/output \\
+    --create_zarr
+  ```
+  Use `--overwrite_zarr` to overwrite existing cells.zarr.zip files. Standalone conversion is also available via `python scripts/parquet_to_zarr.py --input-dir /path/to/outs`.
