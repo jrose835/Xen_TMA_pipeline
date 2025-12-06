@@ -148,9 +148,9 @@ def create_zarr_store(output_path: Path, cells_df: pd.DataFrame,
     # Build polygon arrays for nuclei
     nuc_vertices, nuc_num_verts, nuc_idx = build_polygon_arrays(nuc_bounds_df, cell_ids)
 
-    # Create zarr store
+    # Create zarr store (use zarr_format=2 for compatibility with zarr-python 2.x)
     store = ZipStore(str(output_path), mode='w')
-    root = zarr.open(store, mode='w')
+    root = zarr.open(store, mode='w', zarr_format=2)
 
     # Set root attributes
     root.attrs['major_version'] = 6
