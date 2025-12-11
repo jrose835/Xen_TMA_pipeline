@@ -7,7 +7,9 @@ This module can be used standalone or imported by the main pipeline.
 
 Usage (standalone):
     python parquet_to_zarr.py --input-dir ./outs --verbose
-    python parquet_to_zarr.py --input-dir ./outs --punch punch_1a
+    python parquet_to_zarr.py --input-dir ./outs --subdir my_sample
+
+The script will automatically find all subdirectories containing cells.parquet files.
 """
 
 import argparse
@@ -190,38 +192,61 @@ def create_zarr_store(output_path: Path, cells_df: pd.DataFrame,
         print(f"    Created {output_path}")
 
 
-def process_punch_directory(punch_dir: Path, overwrite: bool = False,
-                            verbose: bool = False) -> bool:
+def has_required_files(directory: Path) -> bool:
+    """Check if a directory contains the required cells.parquet file."""
+    return (directory / 'cells.parquet').exists()
+
+
+def find_valid_directories(input_dir: Path, verbose: bool = False) -> list:
     """
-    Process a single punch directory and create cells.zarr.zip.
+    Find all subdirectories that contain cells.parquet files.
+
+    Returns list of Path objects for valid directories.
+    """
+    valid_dirs = []
+
+    # Check all immediate subdirectories
+    for subdir in sorted(input_dir.iterdir()):
+        if subdir.is_dir() and has_required_files(subdir):
+            valid_dirs.append(subdir)
+        elif subdir.is_dir() and verbose:
+            print(f"    Skipping {subdir.name}: missing cells.parquet")
+
+    return valid_dirs
+
+
+def process_directory(target_dir: Path, overwrite: bool = False,
+                      verbose: bool = False) -> bool:
+    """
+    Process a single directory and create cells.zarr.zip.
 
     Returns True if successful, False otherwise.
     """
-    output_path = punch_dir / 'cells.zarr.zip'
+    output_path = target_dir / 'cells.zarr.zip'
 
     # Check if output exists
     if output_path.exists() and not overwrite:
         if verbose:
-            print(f"    Skipping {punch_dir.name}: cells.zarr.zip already exists")
+            print(f"    Skipping {target_dir.name}: cells.zarr.zip already exists")
         return True
 
     # Check for required input files
-    cells_path = punch_dir / 'cells.parquet'
-    cell_bounds_path = punch_dir / 'cell_boundaries.parquet'
-    nuc_bounds_path = punch_dir / 'nucleus_boundaries.parquet'
+    cells_path = target_dir / 'cells.parquet'
+    cell_bounds_path = target_dir / 'cell_boundaries.parquet'
+    nuc_bounds_path = target_dir / 'nucleus_boundaries.parquet'
 
     if not cells_path.exists():
-        print(f"    Error: cells.parquet not found in {punch_dir}")
+        print(f"    Error: cells.parquet not found in {target_dir}")
         return False
 
     if not cell_bounds_path.exists():
-        print(f"    Warning: cell_boundaries.parquet not found in {punch_dir}")
+        print(f"    Warning: cell_boundaries.parquet not found in {target_dir}")
         cell_bounds_df = pd.DataFrame(columns=['cell_id', 'vertex_x', 'vertex_y'])
     else:
         cell_bounds_df = pd.read_parquet(cell_bounds_path)
 
     if not nuc_bounds_path.exists():
-        print(f"    Warning: nucleus_boundaries.parquet not found in {punch_dir}")
+        print(f"    Warning: nucleus_boundaries.parquet not found in {target_dir}")
         nuc_bounds_df = pd.DataFrame(columns=['cell_id', 'vertex_x', 'vertex_y'])
     else:
         nuc_bounds_df = pd.read_parquet(nuc_bounds_path)
@@ -243,12 +268,12 @@ def process_punch_directory(punch_dir: Path, overwrite: bool = False,
 
 def convert_all_punches(outs_dir: str, overwrite: bool = False, verbose: bool = False) -> tuple:
     """
-    Convert all punch directories in outs_dir to zarr format.
+    Convert all directories in outs_dir containing cells.parquet to zarr format.
 
     This is the main entry point for pipeline integration.
 
     Args:
-        outs_dir: Path to the outs directory containing punch_* subdirectories
+        outs_dir: Path to the outs directory containing subdirectories with cells.parquet
         overwrite: If True, overwrite existing cells.zarr.zip files
         verbose: If True, print detailed progress
 
@@ -260,36 +285,36 @@ def convert_all_punches(outs_dir: str, overwrite: bool = False, verbose: bool = 
     if not outs_path.exists():
         raise FileNotFoundError(f"Output directory not found: {outs_dir}")
 
-    # Find punch directories (only directories, not files)
-    punch_dirs = sorted([p for p in outs_path.glob('punch_*') if p.is_dir()])
+    # Find directories with cells.parquet
+    target_dirs = find_valid_directories(outs_path, verbose)
 
-    if not punch_dirs:
-        print(f"  No punch_* directories found in {outs_dir}")
+    if not target_dirs:
+        print(f"  No directories with cells.parquet found in {outs_dir}")
         return (0, 0)
 
-    print(f"  Converting {len(punch_dirs)} punch directories to zarr format...")
+    print(f"  Converting {len(target_dirs)} directories to cells.zarr.zip format...")
 
     success_count = 0
-    for punch_dir in punch_dirs:
+    for target_dir in target_dirs:
         if verbose:
-            print(f"  Processing {punch_dir.name}...")
-        if process_punch_directory(punch_dir, overwrite, verbose):
+            print(f"  Processing {target_dir.name}...")
+        if process_directory(target_dir, overwrite, verbose):
             success_count += 1
         elif not verbose:
-            print(f"    Failed: {punch_dir.name}")
+            print(f"    Failed: {target_dir.name}")
 
-    return (success_count, len(punch_dirs))
+    return (success_count, len(target_dirs))
 
 
 def main():
     """CLI entry point for standalone usage."""
     parser = argparse.ArgumentParser(
-        description='Convert XenSplitter parquet files to cells.zarr.zip format'
+        description='Convert cells.parquet files to cells.zarr.zip format'
     )
     parser.add_argument('--input-dir', required=True, type=Path,
-                        help='Directory containing punch_* subdirectories')
-    parser.add_argument('--punch', type=str, default=None,
-                        help='Process only specific punch directory (e.g., punch_1a)')
+                        help='Directory containing subdirectories with cells.parquet files')
+    parser.add_argument('--subdir', type=str, default=None,
+                        help='Process only a specific subdirectory by name')
     parser.add_argument('--overwrite', action='store_true',
                         help='Overwrite existing cells.zarr.zip files')
     parser.add_argument('--verbose', action='store_true',
@@ -303,29 +328,36 @@ def main():
         print(f"Error: Input directory not found: {input_dir}")
         return 1
 
-    # Find punch directories to process
-    if args.punch:
-        punch_dirs = [input_dir / args.punch]
-        if not punch_dirs[0].exists():
-            print(f"Error: Punch directory not found: {punch_dirs[0]}")
+    # Find directories to process
+    if args.subdir:
+        # Process a specific subdirectory
+        target_dir = input_dir / args.subdir
+        if not target_dir.exists():
+            print(f"Error: Subdirectory not found: {target_dir}")
             return 1
+        if not has_required_files(target_dir):
+            print(f"Error: {target_dir} does not contain cells.parquet")
+            return 1
+        target_dirs = [target_dir]
     else:
-        # Only match directories, not files
-        punch_dirs = sorted([p for p in input_dir.glob('punch_*') if p.is_dir()])
-        if not punch_dirs:
-            print(f"Error: No punch_* directories found in {input_dir}")
+        # Find all subdirectories with required files
+        if args.verbose:
+            print(f"Scanning {input_dir} for directories with cells.parquet...")
+        target_dirs = find_valid_directories(input_dir, args.verbose)
+        if not target_dirs:
+            print(f"Error: No subdirectories with cells.parquet found in {input_dir}")
             return 1
 
-    print(f"Processing {len(punch_dirs)} punch directories...")
+    print(f"Found {len(target_dirs)} directories to process...")
 
     success_count = 0
-    for punch_dir in punch_dirs:
-        print(f"\nProcessing {punch_dir.name}...")
-        if process_punch_directory(punch_dir, args.overwrite, args.verbose):
+    for target_dir in target_dirs:
+        print(f"\nProcessing {target_dir.name}...")
+        if process_directory(target_dir, args.overwrite, args.verbose):
             success_count += 1
 
-    print(f"\nCompleted: {success_count}/{len(punch_dirs)} directories processed successfully")
-    return 0 if success_count == len(punch_dirs) else 1
+    print(f"\nCompleted: {success_count}/{len(target_dirs)} directories processed successfully")
+    return 0 if success_count == len(target_dirs) else 1
 
 
 if __name__ == '__main__':

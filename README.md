@@ -4,41 +4,129 @@ A processing pipeline for tissue microarrays run on the Xenium spatial transcrip
 This pipeline splits Xenium data based on spatial coordinates only.
 It filters cells and transcripts that fall within the coordinate bounds of each punch region, and can also filter by cell size or minimum transcript number.
 
-## Examples:
-  #### Using individual coordinate files from cell_stats_dir
-  ```
-  python Xen_TMA_pipeline.py \\
-    --xenium_bundle_path /path/to/xenium/output \\
-    --cell_stats_dir /path/to/cell_stats \\
-    --output_dir /path/to/output
-  ```
+## Features
 
-  #### Using pre-existing consolidated coordinates file
-  ```
-  python Xen_TMA_pipeline.py \\
-    --xenium_bundle_path /path/to/xenium/output \\
-    --cell_stats_dir /path/to/cell_stats \\
-    --coordinates_file /path/to/all_punch_coordinates.csv \\
-    --output_dir /path/to/output
-  ```
-  #### With quality filters
-  ```
-  python Xen_TMA_pipeline.py \\
-    --xenium_bundle_path /path/to/xenium/output \\
-    --cell_stats_dir /path/to/cell_stats \\
-    --output_dir /path/to/output \\
-    --min_transcripts 10 \\
-    --min_area 50 \\
-    --qv_threshold 25 \\
-    --n_processes 8
-  ```
+The pipeline performs the following steps:
 
-  #### With zarr conversion for creating cells.zarr.zip files
-  ```
-  python Xen_TMA_pipeline.py \\
-    --xenium_bundle_path /path/to/xenium/output \\
-    --cell_stats_dir /path/to/cell_stats \\
-    --output_dir /path/to/output \\
-    --create_zarr
-  ```
-  Use `--overwrite_zarr` to overwrite existing cells.zarr.zip files. Standalone conversion is also available via `python scripts/parquet_to_zarr.py --input-dir /path/to/outs`.
+1. **QC Metrics Calculation** - Generates region-specific quality control metrics
+2. **Data Splitting** - Splits Xenium data files by punch regions based on coordinates. 
+
+## Requirements
+
+- Python 3.8+
+- Required packages: pandas, numpy, h5py, zarr, pyarrow
+- Optional: tifffile (for morphology image cropping)
+
+## Outputs
+
+Each punch subdirectory contains all files required for Xenium Explorer and downstream analysis with Xenium Ranger.
+
+### Main output directory
+- `region_metrics.csv` - QC metrics for each punch region
+- `all_punch_coordinates.csv` - Consolidated punch coordinates (if using cell_stats_dir)
+- `all_cell_stats.csv` - Aggregated cell statistics (if using cell_stats_dir)
+
+### outs/ subdirectory
+- `punch_cell_summary.csv` - Summary of cells per punch
+
+### Each punch_*/ subdirectory contains:
+
+**Core Xenium files:**
+- `cell_feature_matrix.h5` - Cell-gene expression matrix
+- `cells.parquet` - Cell metadata
+- `cell_boundaries.parquet` - Cell boundary polygons
+- `nucleus_boundaries.parquet` - Nucleus boundary polygons
+- `transcripts.parquet` - Transcript locations and assignments
+- `experiment.xenium` - Experiment metadata
+
+**Additional files (unless --run_light is specified):**
+- `metrics_summary.csv` - 10x Xenium format metrics
+- `morphology.ome.tif` - Cropped morphology image
+- `morphology_focus/` - Cropped autofocus images
+- `gene_panel.json` - Gene panel definition
+- `analysis_summary.html` - Analysis summary
+- `cells.zarr.zip` - Xenium Explorer compatible cell data
+- `transcripts.zarr.zip` - Xenium Explorer compatible transcript data
+
+## Usage
+
+### Basic usage with coordinate files from cell_stats_dir
+```bash
+python Xen_TMA_pipeline.py \
+  --xenium_bundle_path /path/to/xenium/output \
+  --cell_stats_dir /path/to/cell_stats \
+  --output_dir /path/to/output
+```
+
+### Using pre-existing consolidated coordinates file
+```bash
+python Xen_TMA_pipeline.py \
+  --xenium_bundle_path /path/to/xenium/output \
+  --coordinates_file /path/to/all_punch_coordinates.csv \
+  --output_dir /path/to/output
+```
+
+### With quality filters
+```bash
+python Xen_TMA_pipeline.py \
+  --xenium_bundle_path /path/to/xenium/output \
+  --cell_stats_dir /path/to/cell_stats \
+  --output_dir /path/to/output \
+  --min_transcripts 10 \
+  --min_area 50 \
+  --qv_threshold 25 \
+  --n_processes 8
+```
+
+### Light mode (skip additional processing and zarr conversion)
+```bash
+python Xen_TMA_pipeline.py \
+  --xenium_bundle_path /path/to/xenium/output \
+  --cell_stats_dir /path/to/cell_stats \
+  --output_dir /path/to/output \
+  --run_light
+```
+
+## Command Line Arguments
+
+### Required Arguments
+| Argument | Description |
+|----------|-------------|
+| `--xenium_bundle_path` | Path to Xenium bundle output directory |
+| `--output_dir` | Path to output directory for split data and metrics |
+
+### Coordinate Input (one required)
+| Argument | Description |
+|----------|-------------|
+| `--cell_stats_dir` | Path to directory containing cell_stats and coordinates CSV files |
+| `--coordinates_file` | Path to all_punch_coordinates.csv file |
+
+### Optional Arguments
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--qv_threshold` | 20 | QV threshold for high quality transcripts |
+| `--n_processes` | 4 | Number of processes for parallel data splitting |
+| `--min_transcripts` | None | Minimum transcript count per cell (cells below this will be blacklisted) |
+| `--min_area` | None | Minimum cell area (cells below this will be blacklisted) |
+| `--skip_zarr` | False | Skip creating cells.zarr.zip and transcripts.zarr.zip files |
+| `--overwrite_zarr` | False | Overwrite existing zarr.zip files |
+| `--run_light` | False | Skip metrics_summary, morphology cropping, auxiliary files, and zarr conversion |
+
+## Standalone Scripts
+
+### Zarr conversion
+Convert cells.parquet to cells.zarr.zip:
+```bash
+python scripts/parquet_to_zarr.py --input-dir /path/to/outs --verbose
+```
+
+Convert transcripts.parquet to transcripts.zarr.zip:
+```bash
+python scripts/transcripts_parquet_to_zarr.py --input-dir /path/to/outs --verbose
+```
+
+Use `--overwrite` to overwrite existing zarr files.
+
+## License
+
+See LICENSE file for details.

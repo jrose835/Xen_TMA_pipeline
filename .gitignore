@@ -5,3 +5,4 @@ toy_data
 *.ini
 tests
 .Rhistory
+*.log
