@@ -11,16 +11,84 @@ Usage (standalone):
 """
 
 import argparse
+import os
+import uuid
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import zarr
-from zarr.storage import ZipStore
+from zarr.storage import LocalStore
+from scipy import sparse
+from numcodecs import Blosc
+import tempfile
+import shutil
+import zipfile
 
 
 # Grid parameters for spatial binning (matching 10x Xenium format)
 GRID_SPACING = 256.0  # microns per grid cell
+DENSITY_SPACING = 20.0  # microns per density bin for metrics_density
+DENSITY_GRID_SIZE = 10.0  # microns for density/gene and density/codeword CSR matrices
+
+# Blosc compressor (matching original Xenium format)
+BLOSC_COMPRESSOR = Blosc(cname='zstd', clevel=5, shuffle=Blosc.SHUFFLE)
+
+# Column metadata for arrays (required by XeniumRanger)
+COLUMN_METADATA = {
+    'gene_category': {
+        'column_names': ['is_gene', 'blank_codeword', 'negative_control', 'unassigned',
+                         'reserved4', 'reserved5', 'reserved6', 'reserved7'],
+        'column_descriptions': ['Is predesigned gene', 'Blank/control codeword',
+                                'Negative control probe', 'Unassigned codeword',
+                                'Reserved', 'Reserved', 'Reserved', 'Reserved']
+    },
+    'codeword_category': {
+        'column_names': ['is_gene', 'blank_codeword', 'negative_control', 'unassigned',
+                         'reserved4', 'reserved5', 'reserved6', 'reserved7'],
+        'column_descriptions': ['Is predesigned gene', 'Blank/control codeword',
+                                'Negative control probe', 'Unassigned codeword',
+                                'Reserved', 'Reserved', 'Reserved', 'Reserved']
+    },
+    'id': {
+        'column_names': ['id_low', 'id_high'],
+        'column_descriptions': ['Transcript ID low bits', 'Transcript ID high bits']
+    },
+    'uuid': {
+        'column_names': ['uuid_low', 'uuid_high'],
+        'column_descriptions': ['UUID low bits', 'UUID high bits']
+    },
+    'valid': {
+        'column_names': ['valid'],
+        'column_descriptions': ['Transcript validity flag']
+    },
+    'status': {
+        'column_names': ['status'],
+        'column_descriptions': ['Transcript status code']
+    },
+    'location': {
+        'column_names': ['x', 'y', 'z'],
+        'column_descriptions': ['X coordinate (microns)', 'Y coordinate (microns)',
+                                'Z coordinate (microns)']
+    },
+    'gene_identity': {
+        'column_names': ['gene_index'],
+        'column_descriptions': ['Gene index in gene_names array']
+    },
+    'quality_score': {
+        'column_names': ['qv'],
+        'column_descriptions': ['Quality value score']
+    },
+    'codeword_identity': {
+        'column_names': ['codeword_index', 'secondary_index'],
+        'column_descriptions': ['Primary codeword index',
+                                'Secondary codeword index (65535 if none)']
+    },
+    'gene_offset': {
+        'column_names': ['start_idx', 'count', 'reserved1', 'reserved2'],
+        'column_descriptions': ['Start index', 'Count', 'Reserved', 'Reserved']
+    }
+}
 
 
 def build_gene_mappings(transcripts_df: pd.DataFrame) -> tuple:
@@ -217,6 +285,131 @@ def build_grid_groups(transcripts_df: pd.DataFrame, gene_index_map: dict,
     return grids
 
 
+def build_density_csr_matrices(transcripts_df: pd.DataFrame, gene_index_map: dict,
+                                codeword_count: int, x_min: float, y_min: float,
+                                n_x: int, n_y: int, verbose: bool = False) -> tuple:
+    """
+    Build CSR sparse matrices for density/gene/ and density/codeword/ groups.
+
+    The sparse matrices use CSR (Compressed Sparse Row) format:
+    - Spatial grid at 20µm spacing
+    - Each row = one spatial bin (linearized grid cell: row = y * n_x + x)
+    - Columns = genes or codewords
+    - Values = transcript counts
+
+    Args:
+        transcripts_df: DataFrame with transcript data
+        gene_index_map: dict mapping gene name to index
+        codeword_count: number of unique codewords
+        x_min, y_min: minimum coordinates in microns
+        n_x, n_y: grid dimensions
+        verbose: print progress
+
+    Returns:
+        tuple: (gene_csr, codeword_csr) scipy.sparse.csr_matrix objects
+    """
+    n_genes = len(gene_index_map)
+    n_bins = n_x * n_y
+
+    # Assign each transcript to a spatial bin
+    bin_x = ((transcripts_df['x_location'] - x_min) / DENSITY_SPACING).astype(int)
+    bin_y = ((transcripts_df['y_location'] - y_min) / DENSITY_SPACING).astype(int)
+
+    # Clip to valid range
+    bin_x = bin_x.clip(0, n_x - 1)
+    bin_y = bin_y.clip(0, n_y - 1)
+
+    # Linearize bin index
+    bin_idx = (bin_y * n_x + bin_x).values
+
+    # Map gene names to indices
+    gene_idx = transcripts_df['feature_name'].map(gene_index_map).values
+
+    # Filter out any unmapped genes (NaN values)
+    valid_gene_mask = ~np.isnan(gene_idx)
+    valid_gene_idx = gene_idx[valid_gene_mask].astype(int)
+    valid_bin_idx_gene = bin_idx[valid_gene_mask]
+
+    # Build gene density CSR matrix using COO format first (more efficient for construction)
+    gene_coo = sparse.coo_matrix(
+        (np.ones(len(valid_gene_idx), dtype=np.uint16),
+         (valid_bin_idx_gene, valid_gene_idx)),
+        shape=(n_bins, n_genes)
+    )
+    gene_csr = gene_coo.tocsr()
+
+    # Codeword density matrix
+    codeword_idx = transcripts_df['codeword_index'].values.astype(int)
+
+    # Filter valid codewords
+    valid_cw_mask = (codeword_idx >= 0) & (codeword_idx < codeword_count)
+    valid_cw_idx = codeword_idx[valid_cw_mask]
+    valid_bin_idx_cw = bin_idx[valid_cw_mask]
+
+    codeword_coo = sparse.coo_matrix(
+        (np.ones(len(valid_cw_idx), dtype=np.uint16),
+         (valid_bin_idx_cw, valid_cw_idx)),
+        shape=(n_bins, codeword_count)
+    )
+    codeword_csr = codeword_coo.tocsr()
+
+    if verbose:
+        print(f"    Built density matrices: gene {gene_csr.shape}, codeword {codeword_csr.shape}")
+        print(f"    Gene nnz: {gene_csr.nnz}, Codeword nnz: {codeword_csr.nnz}")
+
+    return gene_csr, codeword_csr
+
+
+def build_metrics_density(transcripts_df: pd.DataFrame, x_min: float, y_min: float,
+                          n_x: int, n_y: int, qv_threshold: float = 20.0,
+                          verbose: bool = False) -> np.ndarray:
+    """
+    Build metrics_density 3D array for visualization.
+
+    Structure: (n_y, n_x, 4) float32 array
+    - Channel 0: Total transcript count per bin
+    - Channel 1: High-QV transcript count (qv >= threshold)
+    - Channel 2-3: Reserved (zeros)
+
+    Args:
+        transcripts_df: DataFrame with transcript data
+        x_min, y_min: minimum coordinates in microns
+        n_x, n_y: grid dimensions
+        qv_threshold: quality value threshold for high-QV count
+        verbose: print progress
+
+    Returns:
+        numpy array of shape (n_y, n_x, 4), dtype float32
+    """
+    metrics = np.zeros((n_y, n_x, 4), dtype=np.float32)
+
+    # Calculate bin indices for all transcripts
+    bin_x = ((transcripts_df['x_location'] - x_min) / DENSITY_SPACING).astype(int)
+    bin_y = ((transcripts_df['y_location'] - y_min) / DENSITY_SPACING).astype(int)
+
+    # Clip to valid range
+    bin_x = bin_x.clip(0, n_x - 1).values
+    bin_y = bin_y.clip(0, n_y - 1).values
+
+    # Count total transcripts per bin using numpy bincount
+    flat_idx = bin_y * n_x + bin_x
+    total_counts = np.bincount(flat_idx, minlength=n_x * n_y)
+    metrics[:, :, 0] = total_counts.reshape(n_y, n_x).astype(np.float32)
+
+    # Count high-QV transcripts
+    high_qv_mask = transcripts_df['qv'].values >= qv_threshold
+    if high_qv_mask.sum() > 0:
+        high_qv_flat_idx = flat_idx[high_qv_mask]
+        high_qv_counts = np.bincount(high_qv_flat_idx, minlength=n_x * n_y)
+        metrics[:, :, 1] = high_qv_counts.reshape(n_y, n_x).astype(np.float32)
+
+    if verbose:
+        print(f"    Built metrics_density: shape {metrics.shape}")
+        print(f"    Total transcripts: {int(metrics[:,:,0].sum())}, High-QV: {int(metrics[:,:,1].sum())}")
+
+    return metrics
+
+
 def create_zarr_store(output_path: Path, transcripts_df: pd.DataFrame,
                       verbose: bool = False) -> None:
     """
@@ -253,12 +446,25 @@ def create_zarr_store(output_path: Path, transcripts_df: pd.DataFrame,
     y_min = transcripts_df['y_location'].min()
     y_max = transcripts_df['y_location'].max()
 
-    density_spacing = 20.0  # microns
-    density_x_count = int(np.ceil((x_max - x_min) / density_spacing)) + 1
-    density_y_count = int(np.ceil((y_max - y_min) / density_spacing)) + 1
+    density_x_count = int(np.ceil((x_max - x_min) / DENSITY_SPACING)) + 1
+    density_y_count = int(np.ceil((y_max - y_min) / DENSITY_SPACING)) + 1
 
-    # Create zarr store (use zarr_format=2 for compatibility with zarr-python 2.x)
-    store = ZipStore(str(output_path), mode='w')
+    # Build density CSR matrices
+    gene_csr, codeword_csr = build_density_csr_matrices(
+        transcripts_df, gene_index_map, codeword_count,
+        x_min, y_min, density_x_count, density_y_count, verbose
+    )
+
+    # Build metrics_density array
+    metrics_density = build_metrics_density(
+        transcripts_df, x_min, y_min,
+        density_x_count, density_y_count, verbose=verbose
+    )
+
+    # Create zarr store in a temp directory first, then zip to avoid duplicate entries
+    # (zarr v3's ZipStore creates duplicates with zarr_format=2)
+    temp_dir = tempfile.mkdtemp(prefix='zarr_')
+    store = LocalStore(temp_dir)
     root = zarr.open(store, mode='w', zarr_format=2)
 
     # Set root attributes
@@ -270,6 +476,7 @@ def create_zarr_store(output_path: Path, transcripts_df: pd.DataFrame,
     root.attrs['spatial_units'] = 'micron'
     root.attrs['coordinate_space'] = 'global_micron'
     root.attrs['data_format'] = 0
+    root.attrs['dataset_uuid'] = str(uuid.uuid4())
 
     # Gene mappings
     root.attrs['gene_names'] = gene_names
@@ -283,27 +490,132 @@ def create_zarr_store(output_path: Path, transcripts_df: pd.DataFrame,
 
     # Density metrics
     root.attrs['metrics_density_x_origin'] = float(x_min)
-    root.attrs['metrics_density_x_spacing'] = density_spacing
+    root.attrs['metrics_density_x_spacing'] = DENSITY_SPACING
     root.attrs['metrics_density_x_count'] = density_x_count
     root.attrs['metrics_density_y_origin'] = float(y_min)
-    root.attrs['metrics_density_y_spacing'] = density_spacing
+    root.attrs['metrics_density_y_spacing'] = DENSITY_SPACING
     root.attrs['metrics_density_y_count'] = density_y_count
 
-    # Create category arrays
-    root['gene_category'] = gene_category
-    root['codeword_category'] = codeword_category
+    # Create category arrays with column metadata (use Blosc compression like original Xenium)
+    gene_cat_arr = root.create_array('gene_category', shape=gene_category.shape, dtype=gene_category.dtype,
+                                      data=gene_category, compressor=BLOSC_COMPRESSOR)
+    gene_cat_arr.attrs['column_names'] = COLUMN_METADATA['gene_category']['column_names']
+    gene_cat_arr.attrs['column_descriptions'] = COLUMN_METADATA['gene_category']['column_descriptions']
+
+    cw_cat_arr = root.create_array('codeword_category', shape=codeword_category.shape, dtype=codeword_category.dtype,
+                                    data=codeword_category, compressor=BLOSC_COMPRESSOR)
+    cw_cat_arr.attrs['column_names'] = COLUMN_METADATA['codeword_category']['column_names']
+    cw_cat_arr.attrs['column_descriptions'] = COLUMN_METADATA['codeword_category']['column_descriptions']
 
     # Create grid groups
     grids_group = root.create_group('grids')
-    level_group = grids_group.create_group('0')  # Level 0 is the base resolution
 
+    # Build grid keys list (sorted by x,y)
+    grid_keys = sorted(grids.keys(), key=lambda k: (int(k.split(',')[0]), int(k.split(',')[1])))
+
+    # Calculate codeword_to_transcript_counts
+    codeword_to_transcript_counts = [0] * codeword_count
+    for cw_idx in transcripts_df['codeword_index'].values:
+        if 0 <= cw_idx < codeword_count:
+            codeword_to_transcript_counts[int(cw_idx)] += 1
+
+    # Build grid_number_objects and grid_array_shapes
+    grid_number_objects = []
+    grid_array_shapes = []
+    for grid_key in grid_keys:
+        if grid_key in grids:
+            grid_number_objects.append(len(grids[grid_key]['id']))
+            grid_array_shapes.append({})  # Simplified - empty dict per tile
+        else:
+            grid_number_objects.append(0)
+            grid_array_shapes.append({})
+
+    # Set grids group attributes (required by XeniumRanger)
+    grids_group.attrs['grid_key_names'] = ['grid_x_loc', 'grid_y_loc']
+    grids_group.attrs['grid_keys'] = [grid_keys]  # List of lists (one per level)
+    grids_group.attrs['grid_size'] = [GRID_SPACING]
+    grids_group.attrs['number_levels'] = 1
+    grids_group.attrs['grid_zip'] = False
+    grids_group.attrs['codeword_to_transcript_counts'] = codeword_to_transcript_counts
+    grids_group.attrs['grid_number_objects'] = [grid_number_objects]
+    grids_group.attrs['grid_array_shapes'] = [grid_array_shapes]
+    grids_group.attrs['number_objects_per_tile_per_gene'] = []
+
+    # Create level 0 group
+    level_group = grids_group.create_group('0')
+
+    # Create grid tile groups with column metadata (use Blosc compression like original Xenium)
     for grid_key, arrays in grids.items():
         grid_group = level_group.create_group(grid_key)
         for arr_name, arr_data in arrays.items():
-            grid_group[arr_name] = arr_data
+            arr = grid_group.create_array(arr_name, shape=arr_data.shape, dtype=arr_data.dtype,
+                                           data=arr_data, compressor=BLOSC_COMPRESSOR)
+            # Add column metadata to each array
+            if arr_name in COLUMN_METADATA:
+                arr.attrs['column_names'] = COLUMN_METADATA[arr_name]['column_names']
+                arr.attrs['column_descriptions'] = COLUMN_METADATA[arr_name]['column_descriptions']
 
-    # Close store
+    # Create density group with CSR sparse matrices
+    density_group = root.create_group('density')
+
+    # Calculate number of rows for density grid (based on 10um DENSITY_GRID_SIZE vs 20um DENSITY_SPACING)
+    # The density grid at 10um has 2x the resolution of metrics_density at 20um
+    density_n_x = density_x_count * 2
+    density_n_y = density_y_count * 2
+    n_density_rows = density_n_x * density_n_y
+
+    # density/gene/ subgroup (use Blosc compression like original Xenium)
+    gene_density_group = density_group.create_group('gene')
+    gene_density_group.attrs['cols'] = n_genes
+    gene_density_group.attrs['gene_names'] = gene_names
+    gene_density_group.attrs['grid_size'] = [DENSITY_GRID_SIZE, DENSITY_GRID_SIZE]
+    gene_density_group.attrs['rows'] = n_density_rows
+    gene_density_group.attrs['origin'] = {'x': float(x_min), 'y': float(y_min)}
+    gene_data = gene_csr.data.astype(np.uint16)
+    gene_indices = gene_csr.indices.astype(np.uint16)
+    gene_indptr = gene_csr.indptr.astype(np.uint32)
+    gene_density_group.create_array('data', shape=gene_data.shape, dtype=gene_data.dtype, data=gene_data, compressor=BLOSC_COMPRESSOR)
+    gene_density_group.create_array('indices', shape=gene_indices.shape, dtype=gene_indices.dtype, data=gene_indices, compressor=BLOSC_COMPRESSOR)
+    gene_density_group.create_array('indptr', shape=gene_indptr.shape, dtype=gene_indptr.dtype, data=gene_indptr, compressor=BLOSC_COMPRESSOR)
+
+    # density/codeword/ subgroup (use Blosc compression like original Xenium)
+    codeword_density_group = density_group.create_group('codeword')
+    codeword_density_group.attrs['cols'] = codeword_count
+    codeword_density_group.attrs['grid_size'] = [DENSITY_GRID_SIZE, DENSITY_GRID_SIZE]
+    codeword_density_group.attrs['rows'] = n_density_rows
+    codeword_density_group.attrs['origin'] = {'x': float(x_min), 'y': float(y_min)}
+    codeword_density_group.attrs['codeword_names'] = codeword_gene_names
+    cw_data = codeword_csr.data.astype(np.uint16)
+    cw_indices = codeword_csr.indices.astype(np.uint16)
+    cw_indptr = codeword_csr.indptr.astype(np.uint32)
+    codeword_density_group.create_array('data', shape=cw_data.shape, dtype=cw_data.dtype, data=cw_data, compressor=BLOSC_COMPRESSOR)
+    codeword_density_group.create_array('indices', shape=cw_indices.shape, dtype=cw_indices.dtype, data=cw_indices, compressor=BLOSC_COMPRESSOR)
+    codeword_density_group.create_array('indptr', shape=cw_indptr.shape, dtype=cw_indptr.dtype, data=cw_indptr, compressor=BLOSC_COMPRESSOR)
+
+    # Create metrics_density array (3D dense array, use Blosc compression)
+    root.create_array('metrics_density', shape=metrics_density.shape, dtype=metrics_density.dtype, data=metrics_density, compressor=BLOSC_COMPRESSOR)
+
+    if verbose:
+        print(f"    Created density/gene/ ({gene_csr.nnz} entries)")
+        print(f"    Created density/codeword/ ({codeword_csr.nnz} entries)")
+        print(f"    Created metrics_density ({metrics_density.shape})")
+
+    # Close store and create zip from directory
     store.close()
+
+    # Create clean zip file from directory (no duplicates)
+    if output_path.exists():
+        output_path.unlink()  # Remove existing zip
+
+    with zipfile.ZipFile(str(output_path), 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+        for root_path, dirs, files in os.walk(temp_dir):
+            for file in files:
+                file_path = os.path.join(root_path, file)
+                arc_name = os.path.relpath(file_path, temp_dir)
+                zf.write(file_path, arc_name)
+
+    # Clean up temp directory
+    shutil.rmtree(temp_dir)
 
     if verbose:
         print(f"    Created {output_path}")

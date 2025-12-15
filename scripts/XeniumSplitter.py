@@ -12,6 +12,9 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import multiprocessing as mp
 from functools import partial
 from datetime import datetime
+import xml.etree.ElementTree as ET
+import uuid
+import re
 
 # Optional imports for OME-TIFF handling
 try:
@@ -19,6 +22,112 @@ try:
     HAS_TIFFFILE = True
 except ImportError:
     HAS_TIFFFILE = False
+
+# OME-XML namespace
+OME_NS = 'http://www.openmicroscopy.org/Schemas/OME/2016-06'
+OME_NSMAP = {'ome': OME_NS}
+
+
+def _encode_ome_xml_ascii(ome_xml: str) -> str:
+    """
+    Encode non-ASCII characters in OME-XML as XML numeric character references.
+
+    TIFF description tags must be 7-bit ASCII, but OME-XML may contain
+    unicode characters like 'µm' (U+00B5). This function converts them
+    to XML entity format (e.g., &#181;) which is valid ASCII and will
+    be decoded back to unicode when parsed as XML.
+
+    Args:
+        ome_xml: OME-XML string potentially containing non-ASCII characters
+
+    Returns:
+        OME-XML string with non-ASCII characters encoded as XML entities
+    """
+    result = []
+    for char in ome_xml:
+        if ord(char) > 127:
+            # Encode as XML numeric character reference
+            result.append(f'&#{ord(char)};')
+        else:
+            result.append(char)
+    return ''.join(result)
+
+
+def _update_ome_xml_dimensions(ome_xml: str, new_size_x: int, new_size_y: int,
+                                new_size_z: int = None) -> str:
+    """
+    Update OME-XML with new image dimensions while preserving all other metadata.
+
+    Args:
+        ome_xml: Original OME-XML string
+        new_size_x: New image width in pixels
+        new_size_y: New image height in pixels
+        new_size_z: New Z-stack depth (optional, keeps original if None)
+
+    Returns:
+        Modified OME-XML string
+    """
+    # Register namespace to avoid ns0 prefix
+    ET.register_namespace('', OME_NS)
+
+    root = ET.fromstring(ome_xml)
+
+    # Find all Pixels elements and update dimensions
+    for pixels in root.iter(f'{{{OME_NS}}}Pixels'):
+        pixels.set('SizeX', str(new_size_x))
+        pixels.set('SizeY', str(new_size_y))
+        if new_size_z is not None:
+            pixels.set('SizeZ', str(new_size_z))
+
+    # Encode non-ASCII characters for TIFF compatibility
+    return _encode_ome_xml_ascii(ET.tostring(root, encoding='unicode'))
+
+
+def _update_ome_xml_multifile(ome_xml: str, new_size_x: int, new_size_y: int,
+                               new_filenames: List[str], new_uuids: List[str],
+                               current_file_index: int) -> str:
+    """
+    Update OME-XML for multi-file OME-TIFF with new dimensions and file references.
+
+    Args:
+        ome_xml: Original OME-XML string
+        new_size_x: New image width in pixels
+        new_size_y: New image height in pixels
+        new_filenames: List of new filenames for all files in series
+        new_uuids: List of new UUIDs for all files in series (as urn:uuid:xxx)
+        current_file_index: Index of the current file being written
+
+    Returns:
+        Modified OME-XML string
+    """
+    # Register namespace
+    ET.register_namespace('', OME_NS)
+
+    root = ET.fromstring(ome_xml)
+
+    # Update the root OME element's UUID to match the current file
+    root.set('UUID', new_uuids[current_file_index])
+
+    # Update Pixels dimensions
+    for pixels in root.iter(f'{{{OME_NS}}}Pixels'):
+        pixels.set('SizeX', str(new_size_x))
+        pixels.set('SizeY', str(new_size_y))
+
+    # Update TiffData elements with new UUIDs and filenames
+    for tiffdata in root.iter(f'{{{OME_NS}}}TiffData'):
+        # Get the channel index from FirstC attribute
+        first_c = tiffdata.get('FirstC')
+        if first_c is not None:
+            channel_idx = int(first_c)
+
+            # Find or create UUID element
+            uuid_elem = tiffdata.find(f'{{{OME_NS}}}UUID')
+            if uuid_elem is not None:
+                uuid_elem.text = new_uuids[channel_idx]
+                uuid_elem.set('FileName', new_filenames[channel_idx])
+
+    # Encode non-ASCII characters for TIFF compatibility
+    return _encode_ome_xml_ascii(ET.tostring(root, encoding='unicode'))
 
 
 class XeniumDataSplitter:
@@ -481,7 +590,7 @@ class XeniumDataSplitter:
     def _crop_ome_tiff(self, input_path: Path, output_path: Path,
                        x_min: float, x_max: float, y_min: float, y_max: float) -> bool:
         """
-        Crop an OME-TIFF file to specified coordinate bounds.
+        Crop an OME-TIFF file to specified coordinate bounds, preserving full OME metadata.
 
         Args:
             input_path: Path to input OME-TIFF file
@@ -504,8 +613,11 @@ class XeniumDataSplitter:
             px_y_min = int(y_min / px_size)
             px_y_max = int(y_max / px_size)
 
-            # Read the TIFF file - use pages directly to avoid OME series issues
+            # Read the TIFF file and original OME metadata
             with tifffile.TiffFile(input_path) as tif:
+                # Get original OME-XML metadata
+                ome_xml = tif.ome_metadata
+
                 # Check image dimensions from first page
                 page = tif.pages[0]
                 img_height, img_width = page.shape[:2]
@@ -519,9 +631,6 @@ class XeniumDataSplitter:
                 if px_x_max <= px_x_min or px_y_max <= px_y_min:
                     print(f"  Warning: Invalid crop region for {input_path.name}")
                     return False
-
-                # Get number of pages/z-slices
-                n_pages = len(tif.pages)
 
                 # Read and crop each page individually to preserve Z-stack structure
                 cropped_pages = []
@@ -538,43 +647,69 @@ class XeniumDataSplitter:
             crop_width = px_x_max - px_x_min
             n_z = cropped.shape[0]
 
-            # Write cropped image with proper OME-TIFF structure for Xenium
-            # Xenium morphology uses XYZCT dimension order with Z-slices
-            try:
-                tifffile.imwrite(
-                    output_path,
-                    cropped,
-                    photometric='minisblack',
-                    compression='zlib',
-                    tile=(256, 256) if min(crop_height, crop_width) >= 256 else None,
-                    metadata={
-                        'axes': 'ZYX',
-                        'PhysicalSizeX': px_size,
-                        'PhysicalSizeY': px_size,
-                        'PhysicalSizeZ': 3.0,  # Xenium default Z spacing
-                        'PhysicalSizeXUnit': 'um',
-                        'PhysicalSizeYUnit': 'um',
-                        'PhysicalSizeZUnit': 'um',
-                        'Channel': {'Name': 'DAPI'},
-                    }
+            # Update OME-XML with new dimensions while preserving all other metadata
+            if ome_xml:
+                updated_ome_xml = _update_ome_xml_dimensions(
+                    ome_xml, crop_width, crop_height, n_z
                 )
+            else:
+                updated_ome_xml = None
+
+            # Write cropped image with preserved OME metadata
+            try:
+                if updated_ome_xml:
+                    tifffile.imwrite(
+                        output_path,
+                        cropped,
+                        photometric='minisblack',
+                        compression='jpeg2000',
+                        tile=(1024, 1024) if min(crop_height, crop_width) >= 1024 else (256, 256) if min(crop_height, crop_width) >= 256 else None,
+                        description=updated_ome_xml,
+                    )
+                else:
+                    # Fallback to minimal metadata if no OME-XML available
+                    tifffile.imwrite(
+                        output_path,
+                        cropped,
+                        photometric='minisblack',
+                        compression='jpeg2000',
+                        tile=(1024, 1024) if min(crop_height, crop_width) >= 1024 else (256, 256) if min(crop_height, crop_width) >= 256 else None,
+                        metadata={
+                            'axes': 'ZYX',
+                            'PhysicalSizeX': px_size,
+                            'PhysicalSizeY': px_size,
+                            'PhysicalSizeZ': 3.0,
+                            'PhysicalSizeXUnit': 'µm',
+                            'PhysicalSizeYUnit': 'µm',
+                            'PhysicalSizeZUnit': 'µm',
+                            'Channel': {'Name': 'DAPI'},
+                        }
+                    )
             except Exception:
                 # Fallback: write without compression
-                tifffile.imwrite(
-                    output_path,
-                    cropped,
-                    photometric='minisblack',
-                    metadata={
-                        'axes': 'ZYX',
-                        'PhysicalSizeX': px_size,
-                        'PhysicalSizeY': px_size,
-                        'PhysicalSizeZ': 3.0,
-                        'PhysicalSizeXUnit': 'um',
-                        'PhysicalSizeYUnit': 'um',
-                        'PhysicalSizeZUnit': 'um',
-                        'Channel': {'Name': 'DAPI'},
-                    }
-                )
+                if updated_ome_xml:
+                    tifffile.imwrite(
+                        output_path,
+                        cropped,
+                        photometric='minisblack',
+                        description=updated_ome_xml,
+                    )
+                else:
+                    tifffile.imwrite(
+                        output_path,
+                        cropped,
+                        photometric='minisblack',
+                        metadata={
+                            'axes': 'ZYX',
+                            'PhysicalSizeX': px_size,
+                            'PhysicalSizeY': px_size,
+                            'PhysicalSizeZ': 3.0,
+                            'PhysicalSizeXUnit': 'µm',
+                            'PhysicalSizeYUnit': 'µm',
+                            'PhysicalSizeZUnit': 'µm',
+                            'Channel': {'Name': 'DAPI'},
+                        }
+                    )
 
             print(f"  Cropped {input_path.name} to {crop_width}x{crop_height} pixels ({n_z} z-slices)")
             return True
@@ -583,14 +718,18 @@ class XeniumDataSplitter:
             print(f"  Error cropping {input_path.name}: {e}")
             return False
 
-    def _crop_morphology_focus(self, input_path: Path, output_path: Path,
-                               x_min: float, x_max: float, y_min: float, y_max: float) -> bool:
+    def _crop_morphology_focus_multifile(self, input_dir: Path, output_dir: Path,
+                                          x_min: float, x_max: float,
+                                          y_min: float, y_max: float) -> bool:
         """
-        Crop a morphology_focus OME-TIFF file (single channel 2D image).
+        Crop all morphology_focus OME-TIFF files while preserving multi-file structure.
+
+        This method processes all 4 channel files together to maintain the proper
+        multi-file OME-TIFF structure with shared metadata and UUID references.
 
         Args:
-            input_path: Path to input OME-TIFF file
-            output_path: Path for output cropped OME-TIFF file
+            input_dir: Path to input morphology_focus directory
+            output_dir: Path for output morphology_focus directory
             x_min, x_max, y_min, y_max: Coordinates in microns
 
         Returns:
@@ -608,73 +747,121 @@ class XeniumDataSplitter:
             px_y_min = int(y_min / px_size)
             px_y_max = int(y_max / px_size)
 
-            # Read the single-page TIFF file directly (avoid OME series parsing)
-            with tifffile.TiffFile(input_path) as tif:
+            # Find all focus files sorted by channel index
+            focus_files = sorted(input_dir.glob("*.ome.tif"))
+            if not focus_files:
+                print(f"  Warning: No morphology_focus files found in {input_dir}")
+                return False
+
+            n_channels = len(focus_files)
+
+            # Read OME-XML from first file (contains metadata for all channels)
+            with tifffile.TiffFile(focus_files[0]) as tif:
+                ome_xml = tif.ome_metadata
                 page = tif.pages[0]
                 img_height, img_width = page.shape[:2]
 
-                # Clamp coordinates
-                px_x_min = max(0, px_x_min)
-                px_x_max = min(img_width, px_x_max)
-                px_y_min = max(0, px_y_min)
-                px_y_max = min(img_height, px_y_max)
+            # Clamp coordinates
+            px_x_min = max(0, px_x_min)
+            px_x_max = min(img_width, px_x_max)
+            px_y_min = max(0, px_y_min)
+            px_y_max = min(img_height, px_y_max)
 
-                if px_x_max <= px_x_min or px_y_max <= px_y_min:
-                    print(f"  Warning: Invalid crop region for {input_path.name}")
-                    return False
-
-                # Read just the first page (single channel image)
-                data = page.asarray()
-                cropped = data[px_y_min:px_y_max, px_x_min:px_x_max]
-
-            # Get channel name from filename (morphology_focus_0000 -> channel 0)
-            channel_names = ['DAPI', 'ATP1A1/CD45/E-Cadherin', '18S', 'alphaSMA/Vimentin']
-            try:
-                channel_idx = int(input_path.stem.split('_')[-1])
-                channel_name = channel_names[channel_idx] if channel_idx < len(channel_names) else f'Channel_{channel_idx}'
-            except (ValueError, IndexError):
-                channel_name = 'Unknown'
+            if px_x_max <= px_x_min or px_y_max <= px_y_min:
+                print(f"  Warning: Invalid crop region for morphology_focus")
+                return False
 
             crop_height = px_y_max - px_y_min
             crop_width = px_x_max - px_x_min
 
-            # Write as 2D OME-TIFF
-            try:
-                tifffile.imwrite(
-                    output_path,
-                    cropped,
-                    photometric='minisblack',
-                    compression='zlib',
-                    tile=(256, 256) if min(crop_height, crop_width) >= 256 else None,
-                    metadata={
-                        'axes': 'YX',
-                        'PhysicalSizeX': px_size,
-                        'PhysicalSizeY': px_size,
-                        'PhysicalSizeXUnit': 'um',
-                        'PhysicalSizeYUnit': 'um',
-                        'Channel': {'Name': channel_name},
-                    }
-                )
-            except Exception:
-                tifffile.imwrite(
-                    output_path,
-                    cropped,
-                    photometric='minisblack',
-                    metadata={
-                        'axes': 'YX',
-                        'PhysicalSizeX': px_size,
-                        'PhysicalSizeY': px_size,
-                        'PhysicalSizeXUnit': 'um',
-                        'PhysicalSizeYUnit': 'um',
-                        'Channel': {'Name': channel_name},
-                    }
-                )
+            # Generate new filenames and UUIDs for all files
+            new_filenames = [f"morphology_focus_{i:04d}.ome.tif" for i in range(n_channels)]
+            new_uuids = [f"urn:uuid:{uuid.uuid4()}" for _ in range(n_channels)]
 
-            print(f"  Cropped {input_path.name} to {crop_width}x{crop_height} pixels")
+            # Create output directory
+            output_dir.mkdir(exist_ok=True)
+
+            # Process each channel file
+            for i, input_file in enumerate(focus_files):
+                output_file = output_dir / new_filenames[i]
+
+                # Read and crop the image data
+                with tifffile.TiffFile(input_file) as tif:
+                    data = tif.pages[0].asarray()
+                    cropped = data[px_y_min:px_y_max, px_x_min:px_x_max]
+
+                # Generate file-specific OME-XML with correct root UUID for this file
+                if ome_xml:
+                    updated_ome_xml = _update_ome_xml_multifile(
+                        ome_xml, crop_width, crop_height, new_filenames, new_uuids, i
+                    )
+                else:
+                    updated_ome_xml = None
+
+                # Write cropped image with file-specific OME-XML
+                try:
+                    if updated_ome_xml:
+                        tifffile.imwrite(
+                            output_file,
+                            cropped,
+                            photometric='minisblack',
+                            compression='jpeg2000',
+                            tile=(1024, 1024) if min(crop_height, crop_width) >= 1024 else (256, 256) if min(crop_height, crop_width) >= 256 else None,
+                            description=updated_ome_xml,
+                        )
+                    else:
+                        # Fallback to minimal metadata
+                        channel_names = ['DAPI', 'ATP1A1/CD45/E-Cadherin', '18S', 'alphaSMA/Vimentin']
+                        channel_name = channel_names[i] if i < len(channel_names) else f'Channel_{i}'
+                        tifffile.imwrite(
+                            output_file,
+                            cropped,
+                            photometric='minisblack',
+                            compression='jpeg2000',
+                            tile=(1024, 1024) if min(crop_height, crop_width) >= 1024 else (256, 256) if min(crop_height, crop_width) >= 256 else None,
+                            metadata={
+                                'axes': 'YX',
+                                'PhysicalSizeX': px_size,
+                                'PhysicalSizeY': px_size,
+                                'PhysicalSizeXUnit': 'µm',
+                                'PhysicalSizeYUnit': 'µm',
+                                'Channel': {'Name': channel_name},
+                            }
+                        )
+                except Exception:
+                    # Fallback without compression
+                    if updated_ome_xml:
+                        tifffile.imwrite(
+                            output_file,
+                            cropped,
+                            photometric='minisblack',
+                            description=updated_ome_xml,
+                        )
+                    else:
+                        channel_names = ['DAPI', 'ATP1A1/CD45/E-Cadherin', '18S', 'alphaSMA/Vimentin']
+                        channel_name = channel_names[i] if i < len(channel_names) else f'Channel_{i}'
+                        tifffile.imwrite(
+                            output_file,
+                            cropped,
+                            photometric='minisblack',
+                            metadata={
+                                'axes': 'YX',
+                                'PhysicalSizeX': px_size,
+                                'PhysicalSizeY': px_size,
+                                'PhysicalSizeXUnit': 'µm',
+                                'PhysicalSizeYUnit': 'µm',
+                                'Channel': {'Name': channel_name},
+                            }
+                        )
+
+                print(f"  Cropped {input_file.name} to {crop_width}x{crop_height} pixels")
+
             return True
 
         except Exception as e:
-            print(f"  Error cropping {input_path.name}: {e}")
+            print(f"  Error cropping morphology_focus files: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def crop_morphology_files(self, punch_id: str):
@@ -699,24 +886,21 @@ class XeniumDataSplitter:
             output_file = punch_dir / "morphology.ome.tif"
             self._crop_ome_tiff(morphology_file, output_file, x_min, x_max, y_min, y_max)
 
-        # Crop morphology_focus files (single channel 2D images)
+        # Crop morphology_focus files (multi-file OME-TIFF with shared metadata)
         morphology_focus_dir = self.xenium_dir / "morphology_focus"
         if morphology_focus_dir.exists() and morphology_focus_dir.is_dir():
             output_focus_dir = punch_dir / "morphology_focus"
-            output_focus_dir.mkdir(exist_ok=True)
-
-            focus_files = sorted(morphology_focus_dir.glob("*.ome.tif"))
-            for focus_file in focus_files:
-                output_file = output_focus_dir / focus_file.name
-                self._crop_morphology_focus(focus_file, output_file, x_min, x_max, y_min, y_max)
+            self._crop_morphology_focus_multifile(
+                morphology_focus_dir, output_focus_dir, x_min, x_max, y_min, y_max
+            )
 
     def crop_all_morphology_files(self, n_processes: int = 4):
         """
         Crop morphology files for all punch regions with parallel processing.
 
         Optimized approach:
-        1. Load each source image once into memory
-        2. Crop for all punches in parallel
+        1. Load morphology.ome.tif once and crop for all punches in parallel
+        2. Process morphology_focus files per punch to preserve multi-file structure
 
         Args:
             n_processes: Number of parallel processes to use
@@ -743,13 +927,14 @@ class XeniumDataSplitter:
             punch_data.append({
                 'punch_id': punch_id,
                 'punch_dir': str(punch_dir),
+                'coords': coords,
                 'px_x_min': px_x_min,
                 'px_x_max': px_x_max,
                 'px_y_min': px_y_min,
                 'px_y_max': px_y_max,
             })
 
-        # Process main morphology.ome.tif
+        # Process main morphology.ome.tif with metadata preservation
         morphology_file = self.xenium_dir / "morphology.ome.tif"
         if morphology_file.exists():
             print(f"  Loading morphology.ome.tif into memory...")
@@ -761,31 +946,39 @@ class XeniumDataSplitter:
                 n_processes=n_processes
             )
 
-        # Process morphology_focus files
+        # Process morphology_focus files per punch (preserves multi-file structure)
         morphology_focus_dir = self.xenium_dir / "morphology_focus"
         if morphology_focus_dir.exists() and morphology_focus_dir.is_dir():
-            focus_files = sorted(morphology_focus_dir.glob("*.ome.tif"))
+            print(f"  Processing morphology_focus files (multi-file structure)...")
 
-            for focus_file in focus_files:
-                print(f"  Loading {focus_file.name} into memory...")
-                # Create output subdirectories
-                for pd in punch_data:
+            # Process punches in parallel, but files within each punch together
+            def process_punch_focus(pd):
+                try:
                     output_focus_dir = Path(pd['punch_dir']) / "morphology_focus"
-                    output_focus_dir.mkdir(exist_ok=True)
+                    coords = pd['coords']
+                    result = self._crop_morphology_focus_multifile(
+                        morphology_focus_dir, output_focus_dir,
+                        coords['x_min'], coords['x_max'],
+                        coords['y_min'], coords['y_max']
+                    )
+                    return {'punch_id': pd['punch_id'], 'success': result}
+                except Exception as e:
+                    return {'punch_id': pd['punch_id'], 'success': False, 'error': str(e)}
 
-                self._crop_morphology_parallel(
-                    str(focus_file),
-                    punch_data,
-                    f"morphology_focus/{focus_file.name}",
-                    is_zstack=False,
-                    n_processes=n_processes
-                )
+            with ThreadPoolExecutor(max_workers=n_processes) as executor:
+                results = list(executor.map(process_punch_focus, punch_data))
+
+            success_count = sum(1 for r in results if r.get('success', False))
+            print(f"    Processed morphology_focus for {success_count}/{len(punch_data)} punches")
+            for r in results:
+                if not r.get('success', False):
+                    print(f"    Failed punch {r['punch_id']}: {r.get('error', 'unknown error')}")
 
     def _crop_morphology_parallel(self, input_path: str, punch_data: list,
                                    output_filename: str, is_zstack: bool,
                                    n_processes: int = 4):
         """
-        Load image once and crop for all punches in parallel.
+        Load image once and crop for all punches in parallel, preserving OME metadata.
 
         Args:
             input_path: Path to source image
@@ -797,8 +990,9 @@ class XeniumDataSplitter:
         px_size = 0.2125
 
         try:
-            # Load the full image into memory once
+            # Load the full image into memory once, along with OME metadata
             with tifffile.TiffFile(input_path) as tif:
+                ome_xml = tif.ome_metadata
                 page = tif.pages[0]
                 img_height, img_width = page.shape[:2]
 
@@ -806,21 +1000,13 @@ class XeniumDataSplitter:
                     # Read all Z-slices
                     print(f"    Reading {len(tif.pages)} z-slices...")
                     full_data = np.stack([p.asarray() for p in tif.pages], axis=0)
+                    n_z = full_data.shape[0]
                 else:
                     # Single 2D image
                     full_data = page.asarray()
+                    n_z = 1
 
             print(f"    Image loaded: {full_data.shape}, cropping {len(punch_data)} regions...")
-
-            # Get channel name for morphology_focus files
-            channel_name = 'DAPI'
-            if not is_zstack:
-                channel_names = ['DAPI', 'ATP1A1/CD45/E-Cadherin', '18S', 'alphaSMA/Vimentin']
-                try:
-                    channel_idx = int(Path(input_path).stem.split('_')[-1])
-                    channel_name = channel_names[channel_idx] if channel_idx < len(channel_names) else f'Channel_{channel_idx}'
-                except (ValueError, IndexError):
-                    pass
 
             # Prepare tasks for parallel processing
             tasks = []
@@ -836,6 +1022,16 @@ class XeniumDataSplitter:
                     continue
 
                 output_path = Path(pd['punch_dir']) / output_filename
+                crop_width = px_x_max - px_x_min
+                crop_height = px_y_max - px_y_min
+
+                # Generate updated OME-XML for this crop
+                if ome_xml and is_zstack:
+                    updated_ome_xml = _update_ome_xml_dimensions(
+                        ome_xml, crop_width, crop_height, n_z
+                    )
+                else:
+                    updated_ome_xml = None
 
                 tasks.append({
                     'punch_id': pd['punch_id'],
@@ -845,13 +1041,9 @@ class XeniumDataSplitter:
                     'px_y_min': px_y_min,
                     'px_y_max': px_y_max,
                     'is_zstack': is_zstack,
-                    'channel_name': channel_name,
                     'px_size': px_size,
+                    'ome_xml': updated_ome_xml,
                 })
-
-            # Process in parallel using ThreadPoolExecutor (better for I/O bound tasks)
-            # We use threads here since the data is already in memory
-            from concurrent.futures import ThreadPoolExecutor
 
             def crop_and_save(task):
                 try:
@@ -866,45 +1058,61 @@ class XeniumDataSplitter:
                     crop_height = task['px_y_max'] - task['px_y_min']
                     crop_width = task['px_x_max'] - task['px_x_min']
 
-                    # Write the cropped image
-                    if task['is_zstack']:
-                        metadata = {
-                            'axes': 'ZYX',
-                            'PhysicalSizeX': task['px_size'],
-                            'PhysicalSizeY': task['px_size'],
-                            'PhysicalSizeZ': 3.0,
-                            'PhysicalSizeXUnit': 'um',
-                            'PhysicalSizeYUnit': 'um',
-                            'PhysicalSizeZUnit': 'um',
-                            'Channel': {'Name': 'DAPI'},
-                        }
-                    else:
-                        metadata = {
-                            'axes': 'YX',
-                            'PhysicalSizeX': task['px_size'],
-                            'PhysicalSizeY': task['px_size'],
-                            'PhysicalSizeXUnit': 'um',
-                            'PhysicalSizeYUnit': 'um',
-                            'Channel': {'Name': task['channel_name']},
-                        }
-
+                    # Write the cropped image with preserved OME metadata
                     try:
-                        tifffile.imwrite(
-                            task['output_path'],
-                            cropped,
-                            photometric='minisblack',
-                            compression='zlib',
-                            tile=(256, 256) if min(crop_height, crop_width) >= 256 else None,
-                            metadata=metadata
-                        )
+                        if task['ome_xml']:
+                            tifffile.imwrite(
+                                task['output_path'],
+                                cropped,
+                                photometric='minisblack',
+                                compression='zlib',
+                                tile=(256, 256) if min(crop_height, crop_width) >= 256 else None,
+                                description=task['ome_xml'],
+                            )
+                        else:
+                            # Fallback to minimal metadata
+                            if task['is_zstack']:
+                                metadata = {
+                                    'axes': 'ZYX',
+                                    'PhysicalSizeX': task['px_size'],
+                                    'PhysicalSizeY': task['px_size'],
+                                    'PhysicalSizeZ': 3.0,
+                                    'PhysicalSizeXUnit': 'µm',
+                                    'PhysicalSizeYUnit': 'µm',
+                                    'PhysicalSizeZUnit': 'µm',
+                                    'Channel': {'Name': 'DAPI'},
+                                }
+                            else:
+                                metadata = {
+                                    'axes': 'YX',
+                                    'PhysicalSizeX': task['px_size'],
+                                    'PhysicalSizeY': task['px_size'],
+                                    'PhysicalSizeXUnit': 'µm',
+                                    'PhysicalSizeYUnit': 'µm',
+                                }
+                            tifffile.imwrite(
+                                task['output_path'],
+                                cropped,
+                                photometric='minisblack',
+                                compression='zlib',
+                                tile=(256, 256) if min(crop_height, crop_width) >= 256 else None,
+                                metadata=metadata
+                            )
                     except Exception:
                         # Fallback without compression
-                        tifffile.imwrite(
-                            task['output_path'],
-                            cropped,
-                            photometric='minisblack',
-                            metadata=metadata
-                        )
+                        if task['ome_xml']:
+                            tifffile.imwrite(
+                                task['output_path'],
+                                cropped,
+                                photometric='minisblack',
+                                description=task['ome_xml'],
+                            )
+                        else:
+                            tifffile.imwrite(
+                                task['output_path'],
+                                cropped,
+                                photometric='minisblack',
+                            )
 
                     return {'punch_id': task['punch_id'], 'success': True,
                             'size': f"{crop_width}x{crop_height}"}
