@@ -14,15 +14,23 @@ The script will automatically find all subdirectories containing cells.parquet f
 
 import argparse
 import hashlib
+import json
+import os
+import shutil
+import tempfile
+import zipfile
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import tifffile
 import zarr
-from zarr.storage import ZipStore
+from numcodecs import Blosc
+from zarr.storage import LocalStore
 
 
 MAX_VERTICES = 25  # Maximum polygon vertices (stored as 50 values: x1,y1,x2,y2,...)
+PIXEL_SIZE = 0.2125  # µm per pixel for morphology images
 
 
 def convert_cell_id_to_numeric(cell_ids: pd.Series) -> np.ndarray:
@@ -128,11 +136,103 @@ def build_cell_summary(cells_df: pd.DataFrame) -> np.ndarray:
     return summary
 
 
+def get_morphology_shape(punch_dir: Path) -> tuple:
+    """
+    Get the shape of the morphology image in a punch directory.
+
+    Returns:
+        tuple: (height, width) of the morphology image
+    """
+    morph_path = punch_dir / 'morphology.ome.tif'
+    if not morph_path.exists():
+        return None
+
+    with tifffile.TiffFile(morph_path) as tif:
+        # Return (height, width) to match numpy array convention
+        return (tif.pages[0].imagelength, tif.pages[0].imagewidth)
+
+
+def create_masks_group(root: zarr.Group, temp_dir: str, mask_shape: tuple) -> None:
+    """
+    Create the masks group with homogeneous_transform and empty mask arrays.
+
+    XeniumRanger requires a masks group in cells.zarr.zip containing:
+    - homogeneous_transform: 4x4 float32 transformation matrix
+    - 0: nucleus mask array (empty, filled with zeros)
+    - 1: cell mask array (empty, filled with zeros)
+
+    Args:
+        root: zarr root group
+        temp_dir: path to temp directory for direct file creation
+        mask_shape: (height, width) of mask arrays
+    """
+    # Create masks group
+    masks_group = root.create_group('masks')
+
+    # Create homogeneous_transform array (4x4 float32)
+    # Scale factor converts from mask pixel coordinates to micron coordinates
+    scale = 1.0 / PIXEL_SIZE  # ~4.705882
+    transform_data = np.array([
+        [scale, 0.0, 0.0, 0.0],
+        [0.0, scale, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+    ], dtype=np.float32)
+
+    # Create homogeneous_transform using zarr API
+    # Note: zarr v3 infers dtype from data, so don't specify dtype when using data param
+    masks_group.create_array(
+        'homogeneous_transform',
+        data=transform_data,
+        chunks=(4, 4),
+        compressor=Blosc(cname='lz4', clevel=5, shuffle=Blosc.SHUFFLE)
+    )
+
+    # Create empty mask arrays (0 = nucleus, 1 = cell)
+    # Use chunking similar to original Xenium format
+    chunk_y = min(1699, mask_shape[0])
+    chunk_x = min(755, mask_shape[1])
+
+    for mask_idx in [0, 1]:
+        # Create directory for mask zarr array metadata
+        mask_dir = Path(temp_dir) / 'masks' / str(mask_idx)
+        mask_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write .zarray metadata file (empty array, no chunks written = all zeros)
+        zarray_meta = {
+            "chunks": [chunk_y, chunk_x],
+            "compressor": {
+                "blocksize": 0,
+                "clevel": 1,
+                "cname": "zstd",
+                "id": "blosc",
+                "shuffle": 1
+            },
+            "dtype": "<u4",
+            "fill_value": 0,
+            "filters": None,
+            "order": "C",
+            "shape": list(mask_shape),
+            "zarr_format": 2
+        }
+        with open(mask_dir / '.zarray', 'w') as f:
+            json.dump(zarray_meta, f, indent=4)
+
+
 def create_zarr_store(output_path: Path, cells_df: pd.DataFrame,
                       cell_bounds_df: pd.DataFrame, nuc_bounds_df: pd.DataFrame,
-                      verbose: bool = False) -> None:
+                      mask_shape: tuple = None, verbose: bool = False) -> None:
     """
     Create cells.zarr.zip file with required structure for Xenium Explorer.
+
+    Args:
+        output_path: Path to output cells.zarr.zip file
+        cells_df: DataFrame with cell data
+        cell_bounds_df: DataFrame with cell boundary vertices
+        nuc_bounds_df: DataFrame with nucleus boundary vertices
+        mask_shape: Optional (height, width) tuple for mask arrays. If provided,
+                    creates the masks group required by XeniumRanger.
+        verbose: Print progress information
     """
     n_cells = len(cells_df)
     cell_ids = cells_df['cell_id'].tolist()
@@ -150,8 +250,9 @@ def create_zarr_store(output_path: Path, cells_df: pd.DataFrame,
     # Build polygon arrays for nuclei
     nuc_vertices, nuc_num_verts, nuc_idx = build_polygon_arrays(nuc_bounds_df, cell_ids)
 
-    # Create zarr store (use zarr_format=2 for compatibility with zarr-python 2.x)
-    store = ZipStore(str(output_path), mode='w')
+    # Create zarr store in temp directory first, then zip (avoids duplicate entries with ZipStore)
+    temp_dir = tempfile.mkdtemp(prefix='cells_zarr_')
+    store = LocalStore(temp_dir)
     root = zarr.open(store, mode='w', zarr_format=2)
 
     # Set root attributes
@@ -168,8 +269,18 @@ def create_zarr_store(output_path: Path, cells_df: pd.DataFrame,
     # Create cell_id array
     root['cell_id'] = cell_id_array
 
-    # Create cell_summary array
+    # Create cell_summary array with required column metadata
     root['cell_summary'] = cell_summary
+    root['cell_summary'].attrs['column_names'] = [
+        'cell_centroid_x', 'cell_centroid_y', 'cell_area',
+        'nucleus_centroid_x', 'nucleus_centroid_y', 'nucleus_area',
+        'z_level', 'nucleus_count'
+    ]
+    root['cell_summary'].attrs['column_descriptions'] = [
+        'Cell centroid in X', 'Cell centroid in Y', 'Cell area',
+        'Nucleus centroid in X', 'Nucleus centroid in Y', 'Nucleus area',
+        'z_level', 'Nucleus count'
+    ]
 
     # Create polygon_sets group for nuclei (index 0)
     nuc_group = root.create_group('polygon_sets/0')
@@ -185,8 +296,28 @@ def create_zarr_store(output_path: Path, cells_df: pd.DataFrame,
     cell_group['cell_index'] = cell_idx
     cell_group['method'] = np.zeros(n_cells, dtype='uint32')
 
-    # Close store
+    # Create masks group (required by XeniumRanger)
+    if mask_shape is not None:
+        create_masks_group(root, temp_dir, mask_shape)
+        if verbose:
+            print(f"    Created masks group with shape {mask_shape}")
+
+    # Close store and create clean zip file
     store.close()
+
+    # Remove existing output and create fresh zip
+    if output_path.exists():
+        output_path.unlink()
+
+    with zipfile.ZipFile(str(output_path), 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+        for root_path, dirs, files in os.walk(temp_dir):
+            for file in files:
+                file_path = os.path.join(root_path, file)
+                arc_name = os.path.relpath(file_path, temp_dir)
+                zf.write(file_path, arc_name)
+
+    # Clean up temp directory
+    shutil.rmtree(temp_dir)
 
     if verbose:
         print(f"    Created {output_path}")
@@ -257,9 +388,15 @@ def process_directory(target_dir: Path, overwrite: bool = False,
     if verbose:
         print(f"    Loaded {len(cells_df)} cells from {cells_path.name}")
 
+    # Get morphology shape for masks (if morphology.ome.tif exists)
+    mask_shape = get_morphology_shape(target_dir)
+    if mask_shape is None and verbose:
+        print(f"    Warning: morphology.ome.tif not found, masks group will not be created")
+
     # Create zarr store
     try:
-        create_zarr_store(output_path, cells_df, cell_bounds_df, nuc_bounds_df, verbose)
+        create_zarr_store(output_path, cells_df, cell_bounds_df, nuc_bounds_df,
+                          mask_shape=mask_shape, verbose=verbose)
         return True
     except Exception as e:
         print(f"    Error creating zarr store: {e}")

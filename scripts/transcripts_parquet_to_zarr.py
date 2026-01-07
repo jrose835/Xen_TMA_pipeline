@@ -8,6 +8,12 @@ This module can be used standalone or imported by the main pipeline.
 Usage (standalone):
     python transcripts_parquet_to_zarr.py --input-dir ./outs --verbose
     python transcripts_parquet_to_zarr.py --input-dir ./outs --subdir punch_1a
+    python transcripts_parquet_to_zarr.py --input-dir ./outs --original-zarr /path/to/original/transcripts.zarr.zip
+
+Note: The --original-zarr option is important for XeniumRanger compatibility. It ensures all
+FOV names from the original Xenium bundle are included in the punch zarr files, even if
+those FOVs don't have transcripts in the punch region. This prevents XeniumRanger's
+'DuplicateFeatureNameException' error when num_fields_of_view values don't match.
 """
 
 import argparse
@@ -31,6 +37,10 @@ GRID_SPACING = 256.0  # microns per grid cell
 DENSITY_SPACING = 20.0  # microns per density bin for metrics_density
 DENSITY_GRID_SIZE = 10.0  # microns for density/gene and density/codeword CSR matrices
 
+# FOV index offset - Xenium transcript IDs encode FOV as (fov_index + 65536) in high 32 bits
+# To convert to 0-based fov_index, subtract this offset
+FOV_INDEX_OFFSET = 65536
+
 # Blosc compressor (matching original Xenium format)
 BLOSC_COMPRESSOR = Blosc(cname='zstd', clevel=5, shuffle=Blosc.SHUFFLE)
 
@@ -51,12 +61,12 @@ COLUMN_METADATA = {
                                 'Reserved', 'Reserved', 'Reserved', 'Reserved']
     },
     'id': {
-        'column_names': ['id_low', 'id_high'],
-        'column_descriptions': ['Transcript ID low bits', 'Transcript ID high bits']
+        'column_names': ['id', 'fov_index'],
+        'column_descriptions': ['Rna Identifier', 'FOV Index']
     },
     'uuid': {
-        'column_names': ['uuid_low', 'uuid_high'],
-        'column_descriptions': ['UUID low bits', 'UUID high bits']
+        'column_names': ['uuid_w0', 'uuid_w1'],
+        'column_descriptions': ['Blob Unique Identifier, Word 0', 'Blob Unique Identifier, Word 1']
     },
     'valid': {
         'column_names': ['valid'],
@@ -89,6 +99,23 @@ COLUMN_METADATA = {
         'column_descriptions': ['Start index', 'Count', 'Reserved', 'Reserved']
     }
 }
+
+
+def get_fov_names_from_zarr(zarr_path: Path) -> list:
+    """
+    Extract fov_names attribute from a zarr.zip file.
+
+    Args:
+        zarr_path: Path to a transcripts.zarr.zip file
+
+    Returns:
+        List of FOV names from the zarr file
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        with zipfile.ZipFile(zarr_path, 'r') as zf:
+            zf.extractall(tmp)
+        store = zarr.open(tmp, mode='r')
+        return store.attrs.get('fov_names', [])
 
 
 def build_gene_mappings(transcripts_df: pd.DataFrame) -> tuple:
@@ -210,14 +237,23 @@ def build_grid_groups(transcripts_df: pd.DataFrame, gene_index_map: dict,
         n_transcripts = len(group)
 
         # Build arrays for this grid cell
-        # id: (N, 2) uint32 - [transcript_id_low, transcript_id_high or dataset_suffix]
+        # The parquet transcript_id encodes: (high_bits << 32) | local_id
+        # where high_bits = (fov_index + 65536)
         transcript_ids = group['transcript_id'].values.astype(np.uint64)
-        id_array = np.zeros((n_transcripts, 2), dtype=np.uint32)
-        id_array[:, 0] = (transcript_ids & 0xFFFFFFFF).astype(np.uint32)
-        id_array[:, 1] = ((transcript_ids >> 32) & 0xFFFFFFFF).astype(np.uint32)
+        high_bits = ((transcript_ids >> 32) & 0xFFFFFFFF).astype(np.uint32)
+        local_ids = (transcript_ids & 0xFFFFFFFF).astype(np.uint32)
 
-        # uuid: (N, 2) uint32 - same as id for unique identifier
-        uuid_array = id_array.copy()
+        # id: (N, 2) uint32 - [local_id, 0-based_fov_index]
+        # XeniumRanger uses this for indexing into fov_names array
+        id_array = np.zeros((n_transcripts, 2), dtype=np.uint32)
+        id_array[:, 0] = local_ids  # local_id
+        id_array[:, 1] = (high_bits - FOV_INDEX_OFFSET).astype(np.uint32)  # 0-based fov_index
+
+        # uuid: (N, 2) uint32 - [local_id, raw_high_bits]
+        # XeniumRanger uses view("<u8") on this to reconstruct full 64-bit IDs
+        uuid_array = np.zeros((n_transcripts, 2), dtype=np.uint32)
+        uuid_array[:, 0] = local_ids  # local_id
+        uuid_array[:, 1] = high_bits.astype(np.uint32)  # raw high bits (with offset)
 
         # valid: (N, 1) uint8 - all transcripts are valid (1)
         valid_array = np.ones((n_transcripts, 1), dtype=np.uint8)
@@ -411,9 +447,17 @@ def build_metrics_density(transcripts_df: pd.DataFrame, x_min: float, y_min: flo
 
 
 def create_zarr_store(output_path: Path, transcripts_df: pd.DataFrame,
-                      verbose: bool = False) -> None:
+                      verbose: bool = False, all_fov_names: list = None) -> None:
     """
     Create transcripts.zarr.zip file with required structure for Xenium Explorer.
+
+    Args:
+        output_path: Path to write the zarr.zip file
+        transcripts_df: DataFrame containing transcript data
+        verbose: Print detailed progress
+        all_fov_names: Optional list of all FOV names to include (from original bundle).
+                       If None, only FOVs present in the transcripts will be included.
+                       Using all FOV names is required for XeniumRanger compatibility.
     """
     n_transcripts = len(transcripts_df)
 
@@ -434,8 +478,12 @@ def create_zarr_store(output_path: Path, transcripts_df: pd.DataFrame,
         transcripts_df, gene_names, codeword_count
     )
 
-    # Get unique FOV names
-    fov_names = sorted(transcripts_df['fov_name'].dropna().unique().tolist())
+    # Get FOV names - use all_fov_names if provided (for XeniumRanger compatibility),
+    # otherwise use only FOVs present in this punch's transcripts
+    if all_fov_names is not None:
+        fov_names = all_fov_names
+    else:
+        fov_names = sorted(transcripts_df['fov_name'].dropna().unique().tolist())
 
     # Build spatial grids
     grids = build_grid_groups(transcripts_df, gene_index_map, n_genes, verbose)
@@ -497,13 +545,13 @@ def create_zarr_store(output_path: Path, transcripts_df: pd.DataFrame,
     root.attrs['metrics_density_y_count'] = density_y_count
 
     # Create category arrays with column metadata (use Blosc compression like original Xenium)
-    gene_cat_arr = root.create_array('gene_category', shape=gene_category.shape, dtype=gene_category.dtype,
-                                      data=gene_category, compressor=BLOSC_COMPRESSOR)
+    gene_cat_arr = root.create_dataset('gene_category', shape=gene_category.shape, dtype=gene_category.dtype,
+                                        data=gene_category, compressor=BLOSC_COMPRESSOR)
     gene_cat_arr.attrs['column_names'] = COLUMN_METADATA['gene_category']['column_names']
     gene_cat_arr.attrs['column_descriptions'] = COLUMN_METADATA['gene_category']['column_descriptions']
 
-    cw_cat_arr = root.create_array('codeword_category', shape=codeword_category.shape, dtype=codeword_category.dtype,
-                                    data=codeword_category, compressor=BLOSC_COMPRESSOR)
+    cw_cat_arr = root.create_dataset('codeword_category', shape=codeword_category.shape, dtype=codeword_category.dtype,
+                                      data=codeword_category, compressor=BLOSC_COMPRESSOR)
     cw_cat_arr.attrs['column_names'] = COLUMN_METADATA['codeword_category']['column_names']
     cw_cat_arr.attrs['column_descriptions'] = COLUMN_METADATA['codeword_category']['column_descriptions']
 
@@ -548,8 +596,8 @@ def create_zarr_store(output_path: Path, transcripts_df: pd.DataFrame,
     for grid_key, arrays in grids.items():
         grid_group = level_group.create_group(grid_key)
         for arr_name, arr_data in arrays.items():
-            arr = grid_group.create_array(arr_name, shape=arr_data.shape, dtype=arr_data.dtype,
-                                           data=arr_data, compressor=BLOSC_COMPRESSOR)
+            arr = grid_group.create_dataset(arr_name, shape=arr_data.shape, dtype=arr_data.dtype,
+                                             data=arr_data, compressor=BLOSC_COMPRESSOR)
             # Add column metadata to each array
             if arr_name in COLUMN_METADATA:
                 arr.attrs['column_names'] = COLUMN_METADATA[arr_name]['column_names']
@@ -574,9 +622,9 @@ def create_zarr_store(output_path: Path, transcripts_df: pd.DataFrame,
     gene_data = gene_csr.data.astype(np.uint16)
     gene_indices = gene_csr.indices.astype(np.uint16)
     gene_indptr = gene_csr.indptr.astype(np.uint32)
-    gene_density_group.create_array('data', shape=gene_data.shape, dtype=gene_data.dtype, data=gene_data, compressor=BLOSC_COMPRESSOR)
-    gene_density_group.create_array('indices', shape=gene_indices.shape, dtype=gene_indices.dtype, data=gene_indices, compressor=BLOSC_COMPRESSOR)
-    gene_density_group.create_array('indptr', shape=gene_indptr.shape, dtype=gene_indptr.dtype, data=gene_indptr, compressor=BLOSC_COMPRESSOR)
+    gene_density_group.create_dataset('data', shape=gene_data.shape, dtype=gene_data.dtype, data=gene_data, compressor=BLOSC_COMPRESSOR)
+    gene_density_group.create_dataset('indices', shape=gene_indices.shape, dtype=gene_indices.dtype, data=gene_indices, compressor=BLOSC_COMPRESSOR)
+    gene_density_group.create_dataset('indptr', shape=gene_indptr.shape, dtype=gene_indptr.dtype, data=gene_indptr, compressor=BLOSC_COMPRESSOR)
 
     # density/codeword/ subgroup (use Blosc compression like original Xenium)
     codeword_density_group = density_group.create_group('codeword')
@@ -588,12 +636,12 @@ def create_zarr_store(output_path: Path, transcripts_df: pd.DataFrame,
     cw_data = codeword_csr.data.astype(np.uint16)
     cw_indices = codeword_csr.indices.astype(np.uint16)
     cw_indptr = codeword_csr.indptr.astype(np.uint32)
-    codeword_density_group.create_array('data', shape=cw_data.shape, dtype=cw_data.dtype, data=cw_data, compressor=BLOSC_COMPRESSOR)
-    codeword_density_group.create_array('indices', shape=cw_indices.shape, dtype=cw_indices.dtype, data=cw_indices, compressor=BLOSC_COMPRESSOR)
-    codeword_density_group.create_array('indptr', shape=cw_indptr.shape, dtype=cw_indptr.dtype, data=cw_indptr, compressor=BLOSC_COMPRESSOR)
+    codeword_density_group.create_dataset('data', shape=cw_data.shape, dtype=cw_data.dtype, data=cw_data, compressor=BLOSC_COMPRESSOR)
+    codeword_density_group.create_dataset('indices', shape=cw_indices.shape, dtype=cw_indices.dtype, data=cw_indices, compressor=BLOSC_COMPRESSOR)
+    codeword_density_group.create_dataset('indptr', shape=cw_indptr.shape, dtype=cw_indptr.dtype, data=cw_indptr, compressor=BLOSC_COMPRESSOR)
 
     # Create metrics_density array (3D dense array, use Blosc compression)
-    root.create_array('metrics_density', shape=metrics_density.shape, dtype=metrics_density.dtype, data=metrics_density, compressor=BLOSC_COMPRESSOR)
+    root.create_dataset('metrics_density', shape=metrics_density.shape, dtype=metrics_density.dtype, data=metrics_density, compressor=BLOSC_COMPRESSOR)
 
     if verbose:
         print(f"    Created density/gene/ ({gene_csr.nnz} entries)")
@@ -645,9 +693,16 @@ def find_valid_directories(input_dir: Path, verbose: bool = False) -> list:
 
 
 def process_directory(target_dir: Path, overwrite: bool = False,
-                      verbose: bool = False) -> bool:
+                      verbose: bool = False, all_fov_names: list = None) -> bool:
     """
     Process a single directory and create transcripts.zarr.zip.
+
+    Args:
+        target_dir: Directory containing transcripts.parquet
+        overwrite: If True, overwrite existing transcripts.zarr.zip
+        verbose: Print detailed progress
+        all_fov_names: Optional list of all FOV names from original bundle.
+                       Required for XeniumRanger compatibility.
 
     Returns True if successful, False otherwise.
     """
@@ -674,7 +729,7 @@ def process_directory(target_dir: Path, overwrite: bool = False,
 
     # Create zarr store
     try:
-        create_zarr_store(output_path, transcripts_df, verbose)
+        create_zarr_store(output_path, transcripts_df, verbose, all_fov_names)
         return True
     except Exception as e:
         print(f"    Error creating zarr store: {e}")
@@ -683,7 +738,8 @@ def process_directory(target_dir: Path, overwrite: bool = False,
         return False
 
 
-def convert_all_transcripts(outs_dir: str, overwrite: bool = False, verbose: bool = False) -> tuple:
+def convert_all_transcripts(outs_dir: str, overwrite: bool = False, verbose: bool = False,
+                            original_zarr: str = None) -> tuple:
     """
     Convert all directories in outs_dir containing transcripts.parquet to zarr format.
 
@@ -693,6 +749,7 @@ def convert_all_transcripts(outs_dir: str, overwrite: bool = False, verbose: boo
         outs_dir: Path to the outs directory containing subdirectories with transcripts.parquet
         overwrite: If True, overwrite existing transcripts.zarr.zip files
         verbose: If True, print detailed progress
+        original_zarr: Path to original transcripts.zarr.zip for FOV names (XeniumRanger compatibility)
 
     Returns:
         tuple: (success_count, total_count)
@@ -701,6 +758,19 @@ def convert_all_transcripts(outs_dir: str, overwrite: bool = False, verbose: boo
 
     if not outs_path.exists():
         raise FileNotFoundError(f"Output directory not found: {outs_dir}")
+
+    # Get FOV names from original zarr if provided
+    all_fov_names = None
+    if original_zarr:
+        original_zarr_path = Path(original_zarr)
+        if original_zarr_path.exists():
+            if verbose:
+                print(f"  Reading FOV names from {original_zarr_path}...")
+            all_fov_names = get_fov_names_from_zarr(original_zarr_path)
+            if verbose:
+                print(f"  Found {len(all_fov_names)} FOV names in original zarr")
+        else:
+            print(f"  Warning: original zarr not found: {original_zarr}")
 
     # Find directories with transcripts.parquet
     target_dirs = find_valid_directories(outs_path, verbose)
@@ -715,7 +785,7 @@ def convert_all_transcripts(outs_dir: str, overwrite: bool = False, verbose: boo
     for target_dir in target_dirs:
         if verbose:
             print(f"  Processing {target_dir.name}...")
-        if process_directory(target_dir, overwrite, verbose):
+        if process_directory(target_dir, overwrite, verbose, all_fov_names):
             success_count += 1
         elif not verbose:
             print(f"    Failed: {target_dir.name}")
@@ -732,6 +802,8 @@ def main():
                         help='Directory containing subdirectories with transcripts.parquet files')
     parser.add_argument('--subdir', type=str, default=None,
                         help='Process only a specific subdirectory by name')
+    parser.add_argument('--original-zarr', type=Path, default=None,
+                        help='Path to original transcripts.zarr.zip for FOV names (required for XeniumRanger)')
     parser.add_argument('--overwrite', action='store_true',
                         help='Overwrite existing transcripts.zarr.zip files')
     parser.add_argument('--verbose', action='store_true',
@@ -744,6 +816,17 @@ def main():
     if not input_dir.exists():
         print(f"Error: Input directory not found: {input_dir}")
         return 1
+
+    # Get FOV names from original zarr if provided
+    all_fov_names = None
+    if args.original_zarr:
+        original_zarr_path = args.original_zarr.resolve()
+        if original_zarr_path.exists():
+            print(f"Reading FOV names from {original_zarr_path}...")
+            all_fov_names = get_fov_names_from_zarr(original_zarr_path)
+            print(f"Found {len(all_fov_names)} FOV names in original zarr")
+        else:
+            print(f"Warning: original zarr not found: {original_zarr_path}")
 
     # Find directories to process
     if args.subdir:
@@ -770,7 +853,7 @@ def main():
     success_count = 0
     for target_dir in target_dirs:
         print(f"\nProcessing {target_dir.name}...")
-        if process_directory(target_dir, args.overwrite, args.verbose):
+        if process_directory(target_dir, args.overwrite, args.verbose, all_fov_names):
             success_count += 1
 
     print(f"\nCompleted: {success_count}/{len(target_dirs)} directories processed successfully")
