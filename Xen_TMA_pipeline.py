@@ -191,6 +191,28 @@ def run_splitter_step(args, cell_blacklist):
         if not os.path.exists(coordinates_file):
             raise FileNotFoundError(f"Coordinates file not found: {coordinates_file}")
 
+        # Filter coordinates to only those matching the current bundle.
+        # When multiple pipeline runs share an output directory, the accumulated
+        # all_punch_coordinates.csv may contain rows from different bundles.
+        # Splitting all rows against the current bundle would overwrite earlier
+        # outputs with data from the wrong TMA.
+        coords_df = pd.read_csv(coordinates_file)
+        bundle_path_str = str(args.xenium_bundle_path)
+        if 'path' in coords_df.columns:
+            matched = coords_df[coords_df['path'].astype(str) == bundle_path_str]
+            if len(matched) < len(coords_df):
+                n_skipped = len(coords_df) - len(matched)
+                print(f"Filtering coordinates to current bundle: keeping {len(matched)}/{len(coords_df)} rows ({n_skipped} from other bundles skipped)")
+                if len(matched) == 0:
+                    raise ValueError(
+                        f"No coordinates match the current bundle path '{bundle_path_str}'. "
+                        f"Bundle paths in coordinates file: {coords_df['path'].unique().tolist()}"
+                    )
+                # Write filtered coordinates to a temp file for the splitter
+                filtered_coords_file = Path(args.output_dir) / "all_punch_coordinates_filtered.csv"
+                matched.to_csv(filtered_coords_file, index=False)
+                coordinates_file = filtered_coords_file
+
         # Create outs subdirectory for split data
         outs_dir = Path(args.output_dir) / "outs"
         outs_dir.mkdir(exist_ok=True)
