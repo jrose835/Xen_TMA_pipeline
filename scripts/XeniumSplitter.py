@@ -505,6 +505,15 @@ class XeniumDataSplitter:
         # Use region_metrics if provided, otherwise use coords
         metrics = region_metrics if region_metrics else {}
 
+        # region_metrics.csv carries densities per mm^2; the 10x metrics_summary schema wants
+        # per 100 um^2, and 1 mm^2 = 10,000 x 100 um^2.
+        def _per_100um2(key):
+            v = metrics.get(key, '')
+            try:
+                return float(v) / 1e4
+            except (TypeError, ValueError):
+                return ''
+
         # Build metrics dictionary in 10x format
         metrics_summary = {
             'run_name': run_name,
@@ -519,8 +528,8 @@ class XeniumDataSplitter:
             'fraction_transcripts_decoded_q20': metrics.get('fraction_transcripts_decoded_q20', ''),
             'fraction_predesigned_transcripts_decoded_q20': '',
             'fraction_custom_transcripts_decoded_q20': '',
-            'nuclear_transcripts_per_100um2': metrics.get('nuclear_transcripts_per_100um2', ''),
-            'decoded_transcripts_per_100um2': metrics.get('decoded_transcripts_per_100um2', ''),
+            'nuclear_transcripts_per_100um2': _per_100um2('nuclear_transcripts_per_mm2'),
+            'decoded_transcripts_per_100um2': _per_100um2('decoded_transcripts_per_mm2'),
             'adjusted_negative_control_probe_rate': '',
             'adjusted_negative_control_codeword_rate': '',
             'adjusted_genomic_control_probe_rate': '',
@@ -530,7 +539,7 @@ class XeniumDataSplitter:
             'estimated_number_of_false_positive_transcripts_per_cell_including_genomic_counts': '',
             'num_cells_detected': metrics.get('num_cells', ''),
             'fraction_empty_cells': metrics.get('percent_empty_cells', ''),
-            'cells_per_100um2': metrics.get('cells_per_100um2', ''),
+            'cells_per_100um2': _per_100um2('cells_per_mm2'),
             'fraction_transcripts_assigned': metrics.get('percent_transcripts_in_cells', ''),
             'median_genes_per_cell': metrics.get('median_genes_per_cell', ''),
             'median_predesigned_genes_per_cell': '',

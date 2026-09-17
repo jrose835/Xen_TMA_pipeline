@@ -133,23 +133,15 @@ def process_region_metrics(cells_df, transcripts_df, x_min, x_max, y_min, y_max,
     nuclear_transcripts = filtered_transcripts_highqv[filtered_transcripts_highqv.get('nucleus_distance', pd.Series(dtype=float)) <= 0] if 'nucleus_distance' in filtered_transcripts_highqv.columns else pd.DataFrame()
     total_nuclear_transcripts = len(nuclear_transcripts)
     
-    # Nuclear transcript density per 100um2
-    nuclear_transcripts_per_100um2 = (
-        total_nuclear_transcripts / (meta.get('region_area', 0) / 1e6) * 100
-        if meta.get('region_area', 0) > 0 else np.nan
-    )
-    
-    # Decoded transcripts per 100um2
-    decoded_transcripts_per_100um2 = (
-        total_filtered_transcripts_highqv / (meta.get('region_area', 0) / 1e6) * 100
-        if meta.get('region_area', 0) > 0 else np.nan
-    )
-    
-    # Cells per 100um2
-    cells_per_100um2 = (
-        num_cells / (meta.get('region_area', 0) / 1e6) * 100
-        if meta.get('region_area', 0) > 0 else np.nan
-    )
+    # Densities per mm^2. region_area is in um^2 (Xenium Explorer '#Areas (um^2)'), so
+    # n / (area / 1e6) is per mm^2. The previous code multiplied that by 100 and labelled
+    # it per 100 um^2, a factor of 1e6 too large (ROSC handoff, defect 3).
+    region_area_um2 = meta.get('region_area', 0) or 0
+    def _per_mm2(n):
+        return n / (region_area_um2 / 1e6) if region_area_um2 > 0 else np.nan
+    nuclear_transcripts_per_mm2 = _per_mm2(total_nuclear_transcripts)
+    decoded_transcripts_per_mm2 = _per_mm2(total_filtered_transcripts_highqv)
+    cells_per_mm2 = _per_mm2(num_cells)
 
     # Gene counts per cell
     if 'cell_id' in transcripts_in_cells.columns and len(transcripts_in_cells) > 0:
@@ -172,13 +164,13 @@ def process_region_metrics(cells_df, transcripts_df, x_min, x_max, y_min, y_max,
         'median_cell_area': median_cell_area,
         'max_cell_area': max_cell_area,
         'total_cell_area': total_cell_area,
-        'cells_per_100um2': cells_per_100um2,
+        'cells_per_mm2': cells_per_mm2,
         'total_transcripts': total_transcripts,
         'total_high_qv_transcripts': total_filtered_transcripts_highqv,
         'fraction_transcripts_decoded_q20': total_filtered_transcripts_highqv / total_transcripts if total_transcripts > 0 else np.nan,
         'total_nuclear_transcripts': total_nuclear_transcripts,
-        'nuclear_transcripts_per_100um2': nuclear_transcripts_per_100um2,
-        'decoded_transcripts_per_100um2': decoded_transcripts_per_100um2,
+        'nuclear_transcripts_per_mm2': nuclear_transcripts_per_mm2,
+        'decoded_transcripts_per_mm2': decoded_transcripts_per_mm2,
         'total_transcripts_in_cells': total_transcripts_in_cells,
         'percent_transcripts_in_cells': percent_transcripts_in_cells,
         'total_empty_cells': num_empty_cells,
