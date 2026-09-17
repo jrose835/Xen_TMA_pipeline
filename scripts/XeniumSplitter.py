@@ -251,9 +251,13 @@ class XeniumDataSplitter:
             for punch_id in self.punch_ids:
                 # Get cells in this punch based on coordinates (already filtered by blacklist)
                 cells_in_punch = self.get_cells_in_punch(punch_id)
-                punch_cell_ids = set(cells_in_punch['cell_id'].astype(str))
+                # Keep the parent cells.parquet row order. Iterating a set here made the h5
+                # barcode order a salted-hash walk that differed between two runs of identical
+                # code (ROSC handoff, defect 1); cells.parquet is written with a boolean mask
+                # and so keeps parent order. Both files now list cells in the same order.
+                punch_cell_ids = list(dict.fromkeys(cells_in_punch['cell_id'].astype(str)))
                 
-                # Get indices for cells that exist in the matrix
+                # Get indices for cells that exist in the matrix, in that order
                 punch_cell_indices = [cell_id_to_index[cell_id] 
                                     for cell_id in punch_cell_ids 
                                     if cell_id in cell_id_to_index]
@@ -304,17 +308,17 @@ class XeniumDataSplitter:
         features_data = shared_data['features_data']
         
         # Create new matrix for this punch
-        with h5py.File(output_file, 'w') as out_f:
-            matrix_out = out_f.create_group('matrix')
+        with h5py.File(output_file, 'w', track_order=False) as out_f:
+            matrix_out = out_f.create_group('matrix', track_order=False)
             
             # Copy features
             features_out = matrix_out.create_group('features')
             for key, data_array in features_data.items():
-                features_out.create_dataset(key, data=data_array)
+                features_out.create_dataset(key, data=data_array, track_times=False)
             
             # Filter barcodes
             punch_barcodes = [barcodes[i] for i in cell_indices]
-            matrix_out.create_dataset('barcodes', data=punch_barcodes)
+            matrix_out.create_dataset('barcodes', data=punch_barcodes, track_times=False)
             
             # Extract sparse matrix data for selected cells
             total_elements = sum(indptr[idx + 1] - indptr[idx] for idx in cell_indices)
@@ -334,10 +338,10 @@ class XeniumDataSplitter:
                 current_pos += cell_size
                 new_indptr[i + 1] = current_pos
             
-            matrix_out.create_dataset('data', data=new_data)
-            matrix_out.create_dataset('indices', data=new_indices)
-            matrix_out.create_dataset('indptr', data=new_indptr)
-            matrix_out.create_dataset('shape', data=[shape[0], len(cell_indices)])
+            matrix_out.create_dataset('data', data=new_data, track_times=False)
+            matrix_out.create_dataset('indices', data=new_indices, track_times=False)
+            matrix_out.create_dataset('indptr', data=new_indptr, track_times=False)
+            matrix_out.create_dataset('shape', data=[shape[0], len(cell_indices)], track_times=False)
         
         return {'punch_id': punch_id, 'cell_count': len(cell_indices)}
     
@@ -1161,6 +1165,58 @@ class XeniumDataSplitter:
             self.copy_auxiliary_files(punch_id)
             print(f"  Copied files for punch {punch_id}")
     
+    def verify_punch_outputs(self) -> Dict[str, int]:
+        """
+        Cross-check every punch bundle after the split and raise on the first inconsistency.
+
+        Checks, per punch: h5 barcodes == cells.parquet cell_id element-wise (the ROSC
+        cell-area join defect A1 was only possible because these disagreed); h5 shape and
+        indptr agree with the cell count; boundary id sets are subsets of the cell id set;
+        no cell_id appears in two punches of this parent. Returns cells per punch.
+        """
+        print("Verifying punch outputs...")
+        seen: Dict[str, str] = {}
+        counts: Dict[str, int] = {}
+        for punch_id in self.punch_ids:
+            punch_dir = self.output_base_dir / f"punch_{punch_id}"
+            cells_path = punch_dir / "cells.parquet"
+            h5_path = punch_dir / "cell_feature_matrix.h5"
+            if not cells_path.exists() and not h5_path.exists():
+                print(f"  Warning: punch {punch_id} produced no cells; directory holds no cell files")
+                counts[punch_id] = 0
+                continue
+            if not (cells_path.exists() and h5_path.exists()):
+                raise RuntimeError(f"punch {punch_id}: only one of cells.parquet / cell_feature_matrix.h5 was written")
+            cell_ids = pd.read_parquet(cells_path, columns=['cell_id'])['cell_id'].astype(str).tolist()
+            with h5py.File(h5_path, 'r') as h:
+                barcodes = [b.decode('utf-8') if isinstance(b, bytes) else str(b) for b in h['matrix/barcodes'][:]]
+                shape = h['matrix/shape'][:]
+                n_indptr = h['matrix/indptr'].shape[0]
+            if barcodes != cell_ids:
+                n_mismatch = sum(a != b for a, b in zip(barcodes, cell_ids)) + abs(len(barcodes) - len(cell_ids))
+                raise RuntimeError(
+                    f"punch {punch_id}: cell_feature_matrix.h5 barcode order differs from cells.parquet "
+                    f"cell_id order ({n_mismatch} positions differ, {len(barcodes)} vs {len(cell_ids)} cells). "
+                    "A positional join between these files would attach values to the wrong cells.")
+            if int(shape[1]) != len(cell_ids) or n_indptr != len(cell_ids) + 1:
+                raise RuntimeError(f"punch {punch_id}: h5 shape {tuple(shape)} / indptr {n_indptr} disagree with {len(cell_ids)} cells")
+            cell_set = set(cell_ids)
+            for name in ("cell_boundaries.parquet", "nucleus_boundaries.parquet"):
+                bpath = punch_dir / name
+                if bpath.exists():
+                    bids = set(pd.read_parquet(bpath, columns=['cell_id'])['cell_id'].astype(str))
+                    extra = bids - cell_set
+                    if extra:
+                        raise RuntimeError(f"punch {punch_id}: {name} holds {len(extra)} cell_ids absent from cells.parquet")
+            for cid in cell_ids:
+                other = seen.get(cid)
+                if other is not None:
+                    raise RuntimeError(f"cell {cid} assigned to both punch {other} and punch {punch_id}")
+                seen[cid] = punch_id
+            counts[punch_id] = len(cell_ids)
+            print(f"  punch {punch_id}: {len(cell_ids)} cells, h5 and parquet agree")
+        return counts
+
     def split_all_data(self, experiment_modifications: Dict = None, n_processes=4,
                        run_light: bool = False, region_metrics_df: pd.DataFrame = None):
         """
@@ -1211,6 +1267,9 @@ class XeniumDataSplitter:
         self.split_parquet_files()
         self.split_transcripts_file()
         self.create_experiment_files(experiment_modifications)
+
+        # Cross-check the split before anything downstream reads it
+        self.verify_punch_outputs()
 
         # Create summary
         summary_df = self.create_cell_stats_summary()
