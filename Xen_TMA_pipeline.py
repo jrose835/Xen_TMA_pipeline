@@ -154,9 +154,10 @@ def run_metrics_step(args, cell_blacklist):
         # Verify output files were created
         expected_files = ["region_metrics.csv"]
         
-        # Only expect all_punch_coordinates.csv if using cell_stats_dir
+        # all_punch_coordinates.csv is derived from the per-punch exports; all_cell_stats.csv
+        # only exists when *_cells_stats.csv exports accompany them, so it is not required.
         if args.cell_stats_dir:
-            expected_files.extend(["all_punch_coordinates.csv", "all_cell_stats.csv"])
+            expected_files.append("all_punch_coordinates.csv")
         
         missing_outputs = []
         for file in expected_files:

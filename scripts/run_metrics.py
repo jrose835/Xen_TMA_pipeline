@@ -15,7 +15,9 @@ def parse_metadata_from_header(csv_path):
             lines.append(line.strip())
     meta = {}
     for line in lines:
-        if line.startswith('#Selection name:'):
+        # Xenium Explorer writes '#Selection name:' for a single selection and
+        # '#Selection names:' for a multi-selection export; accept both.
+        if line.startswith('#Selection name'):
             meta['selection_name'] = line.split(':', 1)[1].strip()
         elif line.startswith('#Area'):
             meta['region_area'] = float(line.split(':', 1)[1].strip())
@@ -29,8 +31,12 @@ def parse_metadata_from_header(csv_path):
             meta['replicate'] = "1"
             print(f"Warning: No replicate found in selection_name '{meta['selection_name']}' in {csv_path}, defaulting replicate to '1'.")
         else:
-            meta['punch_id'] = meta['treatment'] = meta['tissue'] = meta['replicate'] = None
-            print(f"Warning: Could not parse selection_name '{meta['selection_name']}' in {csv_path}. Setting all fields to None.")
+            # No '_'-separated components (e.g. '24-2-Liver'): the selection name is the punch id.
+            meta['punch_id'] = meta['selection_name']
+            meta['treatment'] = None
+            meta['tissue'] = None
+            meta['replicate'] = None
+            print(f"Note: selection_name '{meta['selection_name']}' in {csv_path} has no '_' components; using it as punch_id.")
     else:
         meta['punch_id'] = meta['treatment'] = meta['tissue'] = meta['replicate'] = None
         print(f"Warning: No selection_name found in header of {csv_path}. Setting all fields to None.")
@@ -156,6 +162,7 @@ def process_region_metrics(cells_df, transcripts_df, x_min, x_max, y_min, y_max,
 
     metrics.append({
         'punch_id': meta.get('punch_id'),
+        'path': str(xenium_bundle_path),
         'treatment': meta.get('treatment'),
         'tissue': meta.get('tissue'),
         'replicate': meta.get('replicate'),
@@ -284,7 +291,8 @@ def main(
                 # Apply blacklist to cell_stats
                 if cell_blacklist:
                     pre_blacklist_count = len(cell_stats_df)
-                    cell_stats_df = cell_stats_df[~cell_stats_df['cell_id'].astype(str).isin(cell_blacklist)]
+                    id_col = 'Cell ID' if 'Cell ID' in cell_stats_df.columns else 'cell_id'
+                    cell_stats_df = cell_stats_df[~cell_stats_df[id_col].astype(str).isin(cell_blacklist)]
                     blacklisted_count = pre_blacklist_count - len(cell_stats_df)
                     if blacklisted_count > 0:
                         print(f"  Filtered {blacklisted_count} blacklisted cells from cell_stats")
@@ -308,27 +316,48 @@ def main(
     # Create output directory and save all files
     os.makedirs(output_dir, exist_ok=True)
     
+    def _merge_accumulated(new_df, path, label):
+        """Append to an accumulated CSV, replacing rows with the same (punch_id, path).
+
+        Keying on punch_id alone let a second bundle's rows silently displace a first
+        bundle's when two runs shared an output directory (ROSC handoff, defect 4).
+        """
+        if not os.path.exists(path):
+            return new_df
+        existing_df = pd.read_csv(path)
+        if 'path' not in existing_df.columns or 'path' not in new_df.columns:
+            raise ValueError(f"{path} exists without a 'path' column; refusing to merge {label} "
+                             f"from a different bundle by punch_id alone. Use a fresh output_dir.")
+        new_keys = set(zip(new_df['punch_id'].astype(str), new_df['path'].astype(str)))
+        keep = ~existing_df.apply(lambda r: (str(r['punch_id']), str(r['path'])) in new_keys, axis=1)
+        print(f"Appending {label} to {path}: {int(keep.sum())} existing rows kept, "
+              f"{int((~keep).sum())} replaced, {len(new_df)} new")
+        return pd.concat([existing_df[keep], new_df], ignore_index=True)
+
     # Save metrics
     metrics_df = pd.DataFrame(metrics)
     metrics_path = os.path.join(output_dir, "region_metrics.csv")
+    metrics_df = _merge_accumulated(metrics_df, metrics_path, "region metrics")
     metrics_df.to_csv(metrics_path, index=False)
-    print(f"Saved metrics to {metrics_path}")
+    print(f"Saved metrics to {metrics_path} ({len(metrics_df)} rows)")
 
-    # Save aggregated cell stats (only if using cell_stats_dir)
+    # Save aggregated cell stats (only if cells_stats exports were found)
     if all_cell_stats:
         all_cell_stats_df = pd.concat(all_cell_stats, ignore_index=True)
         cell_stats_path = os.path.join(output_dir, "all_cell_stats.csv")
+        all_cell_stats_df = _merge_accumulated(all_cell_stats_df, cell_stats_path, "cell stats")
         all_cell_stats_df.to_csv(cell_stats_path, index=False)
         print(f"Saved aggregated cell stats to {cell_stats_path}")
+    elif cell_stats_dir:
+        print("No *_cells_stats.csv exports found next to the coordinates; all_cell_stats.csv not written")
 
     # Save consolidated punch coordinates (only if using cell_stats_dir)
     if save_coordinates and all_coordinates:
         coordinates_df = pd.DataFrame(all_coordinates)
         coordinates_path = os.path.join(output_dir, "all_punch_coordinates.csv")
+        coordinates_df = _merge_accumulated(coordinates_df, coordinates_path, "punch coordinates")
         coordinates_df.to_csv(coordinates_path, index=False)
-        print(f"Saved consolidated punch coordinates to {coordinates_path}")
-        print(f"Coordinates file contains {len(coordinates_df)} punch regions")
-
+        print(f"Saved consolidated punch coordinates to {coordinates_path} ({len(coordinates_df)} punch regions)")
 
 if __name__ == '__main__':
     import argparse
