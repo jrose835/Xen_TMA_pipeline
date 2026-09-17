@@ -21,8 +21,12 @@ import shutil
 import pandas as pd
 import numpy as np
 
-# Add the scripts directory to the Python path so we can import our modules
+# Add the scripts directory to the Python path so we can import our modules. From a checkout
+# that is ./scripts; from a pip install it is the xen_tma_scripts package directory.
 script_dir = Path(__file__).parent / "scripts"
+if not script_dir.is_dir():
+    import xen_tma_scripts
+    script_dir = Path(xen_tma_scripts.__file__).parent
 sys.path.insert(0, str(script_dir))
 
 try:

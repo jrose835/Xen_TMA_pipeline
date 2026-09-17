@@ -1,8 +1,11 @@
 data
-_pycahce
 __pycache__
 toy_data
 *.ini
-tests
 .Rhistory
 *.log
+.venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
