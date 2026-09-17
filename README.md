@@ -48,6 +48,44 @@ Each punch subdirectory contains all files required for Xenium Explorer and down
 - `cells.zarr.zip` - Xenium Explorer compatible cell data
 - `transcripts.zarr.zip` - Xenium Explorer compatible transcript data
 
+## How coordinates are consumed
+
+The splitter works on axis-aligned bounding boxes, one per punch. There are two ways to supply
+them:
+
+1. `--cell_stats_dir DIR`: a directory of **Xenium Explorer selection exports**, one file per
+   punch, named `<anything>_coordinates.csv`. Each file is read for its header and its vertex
+   list; the bounding box is the min and max of the `X` and `Y` columns. Both header variants
+   Xenium Explorer writes are accepted: `#Selection name:` (single selection) and
+   `#Selection names:` (multi-selection export), followed by `#Area (µm^2):` or `#Areas (µm^2):`.
+   CRLF line endings are fine. The selection name becomes the `punch_id`; if it has three or
+   four `_`-separated parts they are read as `punch_id_treatment_tissue[_replicate]`, otherwise
+   (for example `24-2-Liver`) the whole name is the `punch_id` and the other fields are empty.
+   A matching `<prefix>_cells_stats.csv` export is aggregated into `all_cell_stats.csv` when
+   present but is not required. The consolidated `all_punch_coordinates.csv` is **written** to
+   the output directory as a derived file.
+2. `--coordinates_file FILE`: a previously written `all_punch_coordinates.csv` (columns
+   `punch_id, treatment, tissue, replicate, selection_name, region_area, x_min, x_max, y_min,
+   y_max, coordinate_file, path`). Rows whose `path` is not the current bundle are ignored.
+
+Polygons are not honoured: a non-rectangular selection is reduced to its bounding box. Draw
+rectangles.
+
+## Reproducibility (v0.2.0)
+
+Two runs of identical code on identical inputs produce byte-identical `cell_feature_matrix.h5`,
+`cells.parquet`, boundary and transcript parquets and metrics, regardless of `PYTHONHASHSEED`.
+In every punch the h5 barcode order equals the `cells.parquet` `cell_id` order, and both follow
+the parent `cells.parquet` order. `verify_punch_outputs()` checks this after every split and
+fails the run otherwise. Densities in `region_metrics.csv` are per mm² (`cells_per_mm2`,
+`nuclear_transcripts_per_mm2`, `decoded_transcripts_per_mm2`); the per-punch 10x-format
+`metrics_summary.csv` derives its `*_per_100um2` columns from them. Polygons with more than 25
+vertices are refused at zarr conversion unless `--allow_polygon_truncation` is given. Open
+items are in `BACKLOG.md`; the pinned environment used for ROSC is `envs/XenSplitter.lock.yml`.
+
+Install: `pip install git+https://github.com/jrose835/Xen_TMA_pipeline@v0.2.0` provides the
+`xen-tma-pipeline` command. Tests: `pip install -e .[test] && pytest`.
+
 ## Usage
 
 ### Basic usage with coordinate files from cell_stats_dir
