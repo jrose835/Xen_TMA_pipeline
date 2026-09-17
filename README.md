@@ -80,7 +80,9 @@ the parent `cells.parquet` order. `verify_punch_outputs()` checks this after eve
 fails the run otherwise. Densities in `region_metrics.csv` are per mm² (`cells_per_mm2`,
 `nuclear_transcripts_per_mm2`, `decoded_transcripts_per_mm2`); the per-punch 10x-format
 `metrics_summary.csv` derives its `*_per_100um2` columns from them. Polygons with more than 25
-vertices are refused at zarr conversion unless `--allow_polygon_truncation` is given. Open
+vertices are refused at zarr conversion unless `--allow_polygon_truncation` is given; XOA 6.1
+multimodal-segmentation bundles do contain such cells (5-8% in a Lyons CLP liver region), so pass
+`--skip_zarr` unless you need Xenium Explorer files and accept the truncation knowingly. Open
 items are in `BACKLOG.md`; the pinned environment used for ROSC is `envs/XenSplitter.lock.yml`.
 
 Install: `pip install git+https://github.com/jrose835/Xen_TMA_pipeline@v0.2.0` provides the
