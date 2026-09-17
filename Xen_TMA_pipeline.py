@@ -272,7 +272,8 @@ def run_zarr_conversion_step(args):
         cells_success, cells_total = convert_all_punches(
             outs_dir=str(outs_dir),
             overwrite=args.overwrite_zarr,
-            verbose=True
+            verbose=True,
+            allow_truncation=args.allow_polygon_truncation
         )
 
         if cells_success == cells_total:
@@ -401,6 +402,14 @@ Examples:
         '--overwrite_zarr',
         action='store_true',
         help='Overwrite existing zarr.zip files (default: skip if exists)'
+    )
+
+    parser.add_argument(
+        '--allow_polygon_truncation',
+        action='store_true',
+        help='cells.zarr.zip stores at most 25 vertices per polygon. By default a bundle with '
+             'longer boundaries (Proseg segmentation) is refused; this keeps the first 25 vertices '
+             'and warns, which stores a sector of each such cell rather than the cell (see BACKLOG.md)'
     )
 
     # Light mode argument

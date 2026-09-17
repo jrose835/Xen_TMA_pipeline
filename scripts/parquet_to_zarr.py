@@ -53,13 +53,21 @@ def convert_cell_id_to_numeric(cell_ids: pd.Series) -> np.ndarray:
     return result
 
 
-def build_polygon_arrays(boundaries_df: pd.DataFrame, cell_ids: list) -> tuple:
+def build_polygon_arrays(boundaries_df: pd.DataFrame, cell_ids: list,
+                         allow_truncation: bool = False) -> tuple:
     """
     Convert boundary parquet (one row per vertex) to fixed-size polygon arrays.
 
     Args:
         boundaries_df: DataFrame with cell_id, vertex_x, vertex_y columns
         cell_ids: Ordered list of cell_ids to match
+        allow_truncation: If False (default), refuse any polygon with more than MAX_VERTICES
+            vertices. If True, keep the first MAX_VERTICES vertices and warn loudly. Truncation
+            turns a cell into an angular sector, not a smaller cell (ROSC handoff, defect 2);
+            the real fix is arc-length resampling, tracked in BACKLOG.md.
+
+    Raises:
+        ValueError: when a polygon exceeds MAX_VERTICES and allow_truncation is False.
 
     Returns:
         vertices: (N, 50) float32 array with [x1,y1,x2,y2,...,x25,y25]
@@ -68,6 +76,22 @@ def build_polygon_arrays(boundaries_df: pd.DataFrame, cell_ids: list) -> tuple:
     """
     n_cells = len(cell_ids)
     cell_id_to_idx = {cid: idx for idx, cid in enumerate(cell_ids)}
+
+    if len(boundaries_df) > 0:
+        counts = boundaries_df.groupby('cell_id', sort=False).size()
+        counts = counts[counts.index.isin(cell_id_to_idx)]
+        over = counts[counts > MAX_VERTICES]
+        if len(over) > 0:
+            msg = (f"{len(over)} of {len(counts)} polygons have more than MAX_VERTICES={MAX_VERTICES} "
+                   f"vertices (max {int(counts.max())}; quartiles "
+                   f"{[int(q) for q in counts.quantile([0.25, 0.5, 0.75])]})")
+            if not allow_truncation:
+                raise ValueError(
+                    msg + ". Refusing to truncate: a truncated ring is a sector of the cell, not a "
+                    "smaller cell (defect 2). Resample the boundaries first, or pass "
+                    "allow_truncation=True / --allow_polygon_truncation to keep the first "
+                    f"{MAX_VERTICES} vertices and accept that bias knowingly.")
+            print(f"    WARNING: {msg}; truncating to the first {MAX_VERTICES} vertices as requested")
 
     # Initialize arrays
     vertices = np.zeros((n_cells, MAX_VERTICES * 2), dtype=np.float32)
@@ -85,7 +109,7 @@ def build_polygon_arrays(boundaries_df: pd.DataFrame, cell_ids: list) -> tuple:
             idx = cell_id_to_idx[cell_id]
             coords = group[['vertex_x', 'vertex_y']].values
 
-            # Limit to MAX_VERTICES
+            # Cap at MAX_VERTICES; only reached with allow_truncation=True (checked above)
             n_verts = min(len(coords), MAX_VERTICES)
             num_vertices[idx] = n_verts
 
@@ -221,7 +245,8 @@ def create_masks_group(root: zarr.Group, temp_dir: str, mask_shape: tuple) -> No
 
 def create_zarr_store(output_path: Path, cells_df: pd.DataFrame,
                       cell_bounds_df: pd.DataFrame, nuc_bounds_df: pd.DataFrame,
-                      mask_shape: tuple = None, verbose: bool = False) -> None:
+                      mask_shape: tuple = None, verbose: bool = False,
+                      allow_truncation: bool = False) -> None:
     """
     Create cells.zarr.zip file with required structure for Xenium Explorer.
 
@@ -245,10 +270,10 @@ def create_zarr_store(output_path: Path, cells_df: pd.DataFrame,
     cell_summary = build_cell_summary(cells_df)
 
     # Build polygon arrays for cells
-    cell_vertices, cell_num_verts, cell_idx = build_polygon_arrays(cell_bounds_df, cell_ids)
+    cell_vertices, cell_num_verts, cell_idx = build_polygon_arrays(cell_bounds_df, cell_ids, allow_truncation)
 
     # Build polygon arrays for nuclei
-    nuc_vertices, nuc_num_verts, nuc_idx = build_polygon_arrays(nuc_bounds_df, cell_ids)
+    nuc_vertices, nuc_num_verts, nuc_idx = build_polygon_arrays(nuc_bounds_df, cell_ids, allow_truncation)
 
     # Create zarr store in temp directory first, then zip (avoids duplicate entries with ZipStore)
     temp_dir = tempfile.mkdtemp(prefix='cells_zarr_')
@@ -347,7 +372,7 @@ def find_valid_directories(input_dir: Path, verbose: bool = False) -> list:
 
 
 def process_directory(target_dir: Path, overwrite: bool = False,
-                      verbose: bool = False) -> bool:
+                      verbose: bool = False, allow_truncation: bool = False) -> bool:
     """
     Process a single directory and create cells.zarr.zip.
 
@@ -396,14 +421,16 @@ def process_directory(target_dir: Path, overwrite: bool = False,
     # Create zarr store
     try:
         create_zarr_store(output_path, cells_df, cell_bounds_df, nuc_bounds_df,
-                          mask_shape=mask_shape, verbose=verbose)
+                          mask_shape=mask_shape, verbose=verbose,
+                          allow_truncation=allow_truncation)
         return True
     except Exception as e:
         print(f"    Error creating zarr store: {e}")
         return False
 
 
-def convert_all_punches(outs_dir: str, overwrite: bool = False, verbose: bool = False) -> tuple:
+def convert_all_punches(outs_dir: str, overwrite: bool = False, verbose: bool = False,
+                        allow_truncation: bool = False) -> tuple:
     """
     Convert all directories in outs_dir containing cells.parquet to zarr format.
 
@@ -435,7 +462,7 @@ def convert_all_punches(outs_dir: str, overwrite: bool = False, verbose: bool = 
     for target_dir in target_dirs:
         if verbose:
             print(f"  Processing {target_dir.name}...")
-        if process_directory(target_dir, overwrite, verbose):
+        if process_directory(target_dir, overwrite, verbose, allow_truncation):
             success_count += 1
         elif not verbose:
             print(f"    Failed: {target_dir.name}")
@@ -452,6 +479,9 @@ def main():
                         help='Directory containing subdirectories with cells.parquet files')
     parser.add_argument('--subdir', type=str, default=None,
                         help='Process only a specific subdirectory by name')
+    parser.add_argument('--allow-polygon-truncation', action='store_true',
+                        help=f'Keep the first {MAX_VERTICES} vertices of polygons that exceed the cap '
+                             'instead of refusing (biases the stored cell shape; see BACKLOG.md)')
     parser.add_argument('--overwrite', action='store_true',
                         help='Overwrite existing cells.zarr.zip files')
     parser.add_argument('--verbose', action='store_true',
@@ -490,7 +520,7 @@ def main():
     success_count = 0
     for target_dir in target_dirs:
         print(f"\nProcessing {target_dir.name}...")
-        if process_directory(target_dir, args.overwrite, args.verbose):
+        if process_directory(target_dir, args.overwrite, args.verbose, args.allow_polygon_truncation):
             success_count += 1
 
     print(f"\nCompleted: {success_count}/{len(target_dirs)} directories processed successfully")
